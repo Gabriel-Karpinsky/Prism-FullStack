@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package scanner.v1;
+
+option go_package = "github.com/example/cliffscanner/gen/scanner/v1;scannerv1";
+
+message Empty {}
+
+message ScannerStatus {
+  bool connected = 1;
+  string mode = 2;
+  string control_owner = 3;
+  string control_lease_expires_at = 4;
+  double yaw_deg = 5;
+  double pitch_deg = 6;
+  double coverage = 7;
+  double scan_progress = 8;
+  double scan_duration_seconds = 9;
+  repeated string faults = 10;
+}
+
+message AcquireControlRequest {
+  string user = 1;
+}
+
+message AcquireControlResponse {
+  bool ok = 1;
+  ScannerStatus status = 2;
+}
+
+message ReleaseControlRequest {
+  string user = 1;
+}
+
+message CommandRequest {
+  string user = 1;
+  string command = 2;
+  map<string, string> payload = 3;
+}
+
+message CommandResponse {
+  bool ok = 1;
+  ScannerStatus status = 2;
+}
+
+service ScannerControlService {
+  rpc GetStatus(Empty) returns (ScannerStatus);
+  rpc AcquireControl(AcquireControlRequest) returns (AcquireControlResponse);
+  rpc ReleaseControl(ReleaseControlRequest) returns (AcquireControlResponse);
+  rpc SendCommand(CommandRequest) returns (CommandResponse);
+}

@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Cliff Face Scanner Prototype</title>
+    <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+    <div class="shell">
+        <header class="hero">
+            <div>
+                <p class="eyebrow">Cliff Face Scanner MVP</p>
+                <h1>Scanner control and live surface mapping</h1>
+                <p class="subcopy">One operator controls the scanner while any number of teammates monitor the live map, telemetry, and safety state.</p>
+            </div>
+            <div class="hero-metrics">
+                <div class="metric-card">
+                    <span>Control owner</span>
+                    <strong id="control-owner">Unclaimed</strong>
+                </div>
+                <div class="metric-card">
+                    <span>Mode</span>
+                    <strong id="mode-badge">Idle</strong>
+                </div>
+            </div>
+        </header>
+
+        <main class="dashboard">
+            <section class="panel panel-controls">
+                <div class="panel-head">
+                    <h2>Operator console</h2>
+                    <p>Acquire control before issuing motion or scan commands.</p>
+                </div>
+
+                <label class="field">
+                    <span>User name</span>
+                    <input id="user-name" type="text" maxlength="24" placeholder="e.g. survey-ops">
+                </label>
+
+                <div class="button-row">
+                    <button id="acquire-btn" class="btn btn-primary">Acquire control</button>
+                    <button id="release-btn" class="btn btn-muted">Release</button>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="button-grid">
+                    <button data-command="connect" class="btn">Connect</button>
+                    <button data-command="home" class="btn">Home</button>
+                    <button data-command="start_scan" class="btn btn-primary">Start scan</button>
+                    <button data-command="pause_scan" class="btn">Pause</button>
+                    <button data-command="resume_scan" class="btn">Resume</button>
+                    <button data-command="stop_scan" class="btn">Stop</button>
+                    <button data-command="clear_fault" class="btn">Clear fault</button>
+                    <button data-command="estop" class="btn btn-danger">E-stop</button>
+                </div>
+
+                <div class="divider"></div>
+
+                <div class="jogger">
+                    <p class="section-label">Jog gantry</p>
+                    <div class="button-grid jog-grid">
+                        <button data-jog-axis="yaw" data-jog-delta="-5" class="btn">Yaw -5°</button>
+                        <button data-jog-axis="yaw" data-jog-delta="5" class="btn">Yaw +5°</button>
+                        <button data-jog-axis="pitch" data-jog-delta="-3" class="btn">Pitch -3°</button>
+                        <button data-jog-axis="pitch" data-jog-delta="3" class="btn">Pitch +3°</button>
+                    </div>
+                </div>
+
+                <label class="field">
+                    <span>Resolution</span>
+                    <select id="resolution-select">
+                        <option value="low">Low</option>
+                        <option value="medium" selected>Medium</option>
+                        <option value="high">High</option>
+                    </select>
+                </label>
+
+                <p id="command-status" class="status-line">Waiting for scanner state...</p>
+            </section>
+
+            <section class="panel panel-map">
+                <div class="panel-head">
+                    <h2>Live surface map</h2>
+                    <p>Synthetic height data is filled in raster order to mimic a cliff-face scan.</p>
+                </div>
+                <canvas id="surface-map" width="960" height="480"></canvas>
+                <div class="map-legend">
+                    <span>Low</span>
+                    <div class="legend-bar"></div>
+                    <span>High</span>
+                </div>
+            </section>
+
+            <section class="panel panel-telemetry">
+                <div class="panel-head">
+                    <h2>Telemetry</h2>
+                    <p>Live state from the control server.</p>
+                </div>
+                <div class="telemetry-grid">
+                    <div class="telemetry-card">
+                        <span>Yaw</span>
+                        <strong id="yaw-value">0.0°</strong>
+                    </div>
+                    <div class="telemetry-card">
+                        <span>Pitch</span>
+                        <strong id="pitch-value">0.0°</strong>
+                    </div>
+                    <div class="telemetry-card">
+                        <span>Coverage</span>
+                        <strong id="coverage-value">0%</strong>
+                    </div>
+                    <div class="telemetry-card">
+                        <span>Progress</span>
+                        <strong id="progress-value">0%</strong>
+                    </div>
+                    <div class="telemetry-card">
+                        <span>Motor temp</span>
+                        <strong id="motor-temp-value">0.0 C</strong>
+                    </div>
+                    <div class="telemetry-card">
+                        <span>Latency</span>
+                        <strong id="latency-value">0 ms</strong>
+                    </div>
+                </div>
+
+                <div class="progress-wrap">
+                    <div class="progress-bar">
+                        <div id="progress-fill" class="progress-fill"></div>
+                    </div>
+                    <small id="scan-duration-value">Estimated duration: 0s</small>
+                </div>
+
+                <div id="fault-banner" class="fault-banner hidden"></div>
+            </section>
+
+            <section class="panel panel-log">
+                <div class="panel-head">
+                    <h2>Activity log</h2>
+                    <p>Recent scanner, motion, control, and safety events.</p>
+                </div>
+                <ul id="activity-log" class="log-list"></ul>
+            </section>
+        </main>
+    </div>
+
+    <script src="/app.js"></script>
+</body>
+</html>
