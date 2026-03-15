@@ -1,50 +1,51 @@
 # Architecture Notes
 
-## Prototype architecture
+## MVP production split
 
-The current prototype is intentionally simple:
-
-- a PowerShell server owns the shared scanner state
-- a browser app polls the server and renders the control dashboard
-- the Arduino Mega firmware scaffold defines the hardware-side responsibilities and serial contract
-
-This lets the demo run in a minimal environment while still preserving the production system boundaries.
-
-## Production architecture
-
-For a production build, keep these layers separate:
+The MVP is now organized around a Raspberry Pi edge host:
 
 1. `firmware/arduino-mega`
    Motion control, homing, limit switches, watchdogs, and compact telemetry.
-2. `edge-daemon` in C++
-   The sole hardware owner. It speaks serial to the Mega and vendor SDKs to lidar/radar hardware.
-3. `control-api` in Go
-   Authentication, operator lock, scan sessions, persistence, audit log, and browser-facing APIs.
-4. `web-ui`
-   Browser-based monitoring and control, including the live map or point cloud viewer.
+2. `apps/edge-daemon`
+   Native C++ service on the Raspberry Pi. It owns the Arduino link, lidar acquisition, scan state, and the localhost hardware API.
+3. `apps/control-api`
+   Go backend for browser-facing APIs, operator lease logic, and serving the web UI.
+4. `apps/web-ui`
+   Browser dashboard for control and live monitoring.
+5. `tailscaled` on the Raspberry Pi host
+   Secure remote connectivity when the lab LAN does not allow direct local access.
 
-## Multi-user control model
+## Why the edge daemon exists
+
+The edge daemon separates hardware timing and fault handling from the web stack.
+
+It is the only process that should:
+
+- open the Arduino serial port
+- read lidar measurements
+- own the live hardware state machine
+- translate scan progress into spatial data
+- keep the scanner safe if the web stack disconnects
+
+The Go backend should not talk to the Arduino directly. It should talk to the edge daemon over a local API.
+
+## Network and hosting model
+
+For the Raspberry Pi deployment:
+
+- the edge daemon binds to `127.0.0.1:9090`
+- the Go backend container binds to `127.0.0.1:8080` using Docker host networking
+- Tailscale runs on the Pi host and publishes the Go backend over the tailnet
+- the lab LAN never needs direct access to the scanner ports
+
+That gives this request path:
+
+`Browser -> Tailscale -> Go backend -> edge daemon -> Arduino/LIDAR`
+
+## Safety model
 
 - only one user may hold the control lease
-- observers can watch telemetry and the live map without the lease
-- all commands pass through the backend
-- the hardware layer never trusts the browser directly
-- emergency stop must remain available even if the web stack fails
-
-## Why the Arduino should stay small
-
-The Arduino Mega is a good motion controller but a poor application server. Keep it responsible for:
-
-- target position tracking
-- step generation or motion scheduling
-- homing and limit switch handling
-- heartbeat / watchdog safety behavior
-- compact binary telemetry
-
-Do not put these on the Mega:
-
-- raw point cloud aggregation
-- browser networking
-- JSON-heavy APIs
-- multi-user session logic
-- long-term scan storage
+- all browser commands terminate at the Go backend first
+- the edge daemon remains the sole hardware owner
+- emergency stop must remain local and effective even if the web stack fails
+- the Arduino remains intentionally small and deterministic

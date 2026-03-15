@@ -1,0 +1,10 @@
+.gocache/
+.gomodcache/
+*.o
+*.obj
+*.exe
+*.out
+apps/edge-daemon/cliffscanner-edge
+apps/edge-daemon/build/
+firmware/arduino-mega/.pio/
+.DS_Store

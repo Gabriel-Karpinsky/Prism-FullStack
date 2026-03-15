@@ -7,9 +7,18 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 
+	"cliffscanner/control-api/internal/edgeclient"
 	"cliffscanner/control-api/internal/scanner"
 )
+
+type apiService interface {
+	Snapshot() scanner.Snapshot
+	Acquire(user string) (scanner.Snapshot, error)
+	Release(user string) (scanner.Snapshot, error)
+	Command(user, command string, payload map[string]any) (scanner.Snapshot, error)
+}
 
 type acquireRequest struct {
 	User string `json:"user"`
@@ -23,15 +32,23 @@ type commandRequest struct {
 
 func main() {
 	port := envOrDefault("PORT", "8080")
+	listenAddr := envOrDefault("HTTP_BIND", ":"+port)
 	repoRoot := envOrDefault("REPO_ROOT", guessRepoRoot())
-	uiRoot := filepath.Join(repoRoot, "apps", "web-ui")
+	uiRoot := envOrDefault("UI_ROOT", filepath.Join(repoRoot, "apps", "web-ui"))
 
-	service := scanner.NewService()
+	service := buildService()
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", serveFile(filepath.Join(uiRoot, "index.html"), "text/html; charset=utf-8"))
 	mux.HandleFunc("/styles.css", serveFile(filepath.Join(uiRoot, "styles.css"), "text/css; charset=utf-8"))
 	mux.HandleFunc("/app.js", serveFile(filepath.Join(uiRoot, "app.js"), "application/javascript; charset=utf-8"))
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method not allowed."})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
 
 	mux.HandleFunc("/api/state", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
@@ -101,10 +118,19 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": snapshot})
 	})
 
-	log.Printf("Go control API listening on http://localhost:%s\n", port)
-	if err := http.ListenAndServe(":"+port, mux); err != nil {
+	log.Printf("Go control API listening on http://%s\n", listenAddr)
+	if err := http.ListenAndServe(listenAddr, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func buildService() apiService {
+	mode := strings.ToLower(strings.TrimSpace(envOrDefault("SCANNER_BACKEND", "sim")))
+	if mode == "edge" {
+		baseURL := envOrDefault("EDGE_DAEMON_BASE_URL", "http://127.0.0.1:9090")
+		return scanner.NewEdgeService(edgeclient.New(baseURL))
+	}
+	return scanner.NewService()
 }
 
 func serveFile(path, contentType string) http.HandlerFunc {

@@ -1,0 +1,13 @@
+services:
+  control-api:
+    build:
+      context: ../..
+      dockerfile: apps/control-api/Dockerfile
+    container_name: cliffscanner-control-api
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      HTTP_BIND: 127.0.0.1:8080
+      UI_ROOT: /app/web-ui
+      SCANNER_BACKEND: edge
+      EDGE_DAEMON_BASE_URL: http://127.0.0.1:9090
