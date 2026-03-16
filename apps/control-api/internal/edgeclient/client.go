@@ -17,11 +17,6 @@ type Client struct {
 	http    *http.Client
 }
 
-type commandRequest struct {
-	Command string         `json:"command"`
-	Payload map[string]any `json:"payload"`
-}
-
 type commandResponse struct {
 	OK    bool             `json:"ok"`
 	State scanner.Snapshot `json:"state"`
@@ -51,7 +46,11 @@ func (c *Client) Snapshot() (scanner.Snapshot, error) {
 }
 
 func (c *Client) Command(command string, payload map[string]any) (scanner.Snapshot, error) {
-	body := commandRequest{Command: command, Payload: payload}
+	body := map[string]any{"command": command}
+	for key, value := range payload {
+		body[key] = value
+	}
+
 	var response commandResponse
 	if err := c.postJSON("/api/hardware/command", body, &response); err != nil {
 		return scanner.Snapshot{}, err

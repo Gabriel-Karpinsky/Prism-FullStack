@@ -1,54 +1,49 @@
-# Cliff Face Scanner Prototype
+# Cliff Face Scanner MVP
 
-This repository now contains the first pass of the production-oriented stack for a cliff face scanner MVP.
+This repository contains a deployable MVP stack for the cliff-face scanner.
 
-The intended deployment shape is:
+The intended lab deployment is:
 
-- Arduino Mega for deterministic motion control only
-- Raspberry Pi native C++ edge daemon for hardware ownership and lidar processing
+- Arduino Mega for deterministic yaw/pitch motion control and Garmin trigger output
+- Raspberry Pi native C++ edge daemon for Arduino serial control, Garmin LIDAR-Lite v3HP reads, and scan orchestration
 - Go control API in Docker on the Raspberry Pi
 - Browser UI served directly by the Go backend
-- Tailscale on the Raspberry Pi host for remote operator access when the lab LAN blocks direct connections
+- Tailscale on the Raspberry Pi host for remote operator access when the lab network blocks local connections
 
 ## Repository layout
 
-- `apps/control-api`: Go backend that serves the browser UI and talks either to a simulator or the local edge daemon
-- `apps/edge-daemon`: native C++ Raspberry Pi service that owns the Arduino/LIDAR side of the MVP
-- `apps/prototype-server`: the original PowerShell prototype server kept for reference
+- `apps/control-api`: Go backend that serves the browser UI and operator API
+- `apps/edge-daemon`: native C++ Raspberry Pi service that owns the Arduino and lidar hardware path
 - `apps/web-ui`: dependency-free browser UI
-- `firmware/arduino-mega`: Arduino Mega firmware scaffold
-- `proto/scanner/v1`: future protobuf contract for a stronger multi-language boundary
+- `firmware/arduino-mega`: Arduino Mega firmware for dual step/dir control and trigger output
+- `proto/scanner/v1`: future protobuf contract if the localhost JSON boundary is later upgraded
 - `deploy/pi`: Raspberry Pi deployment assets for systemd, Docker Compose, and Tailscale
-- `docs`: architecture and packaging notes
+- `docs`: architecture, packaging, protocol, and Pi deployment notes
 
-## Current status
+## Current MVP behavior
 
 Implemented now:
 
-- Go backend can run in `sim` mode or `edge` mode
-- edge mode calls a localhost edge daemon API instead of the in-process simulator
-- Docker packaging exists for the Go backend
-- native Raspberry Pi edge daemon scaffold exists in C++
-- systemd service files and Pi deployment scripts are included
-- Tailscale-based remote access is documented as the preferred connection path
+- Arduino firmware drives two stepper axes through external step/dir drivers at 128 microstepping
+- Arduino exposes a line-based serial command/status protocol with heartbeat watchdog and trigger output
+- edge daemon sequences raster scans as `move -> settle -> trigger -> read lidar -> commit cell`
+- Garmin LIDAR-Lite v3HP reads are implemented on the Pi over Linux I2C with a mock fallback for bench work
+- Go backend runs in Docker and talks to the edge daemon over localhost
+- Tailscale is the intended remote access path for lab operation
 
-Still intentionally scaffolded for the MVP:
+Important assumptions to verify in the lab:
 
-- the Garmin LIDAR-Lite v3HP driver is represented by a mock lidar layer that should be replaced with the real register-level implementation on the Pi
-- the Arduino firmware still uses the temporary ASCII control path for motion commands; the framed binary protocol is defined but not yet wired end to end
+- Arduino pin assignments in [HardwareConfig.h](/E:/_Data/_TUE/Prism/Codex web/firmware/arduino-mega/include/HardwareConfig.h)
+- stepper driver DIP switches are physically set to `128` microsteps
+- gear ratios in [HardwareConfig.h](/E:/_Data/_TUE/Prism/Codex web/firmware/arduino-mega/include/HardwareConfig.h) match the gantry mechanics
+- Garmin wiring and I2C bus/address match [edge-daemon.env.example](/E:/_Data/_TUE/Prism/Codex web/deploy/pi/edge-daemon.env.example)
 
 ## Local development
 
-Run the Go backend in simulator mode:
+Run the Go backend against the in-process simulator:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\run-go-backend.ps1 -Port 8080
-```
-
-Run the original PowerShell prototype if needed:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\deploy\run-prototype.ps1 -Port 8080
 ```
 
 ## Raspberry Pi deployment target
@@ -60,4 +55,4 @@ The intended MVP host layout on the Raspberry Pi is:
 - Tailscale host service: `tailscaled`
 - Tailscale Serve publishes `https://<pi-hostname>.<tailnet>.ts.net` to `http://127.0.0.1:8080`
 
-See [docs/pi-deployment.md](/E:/_Data/_TUE/Prism/Codex web/docs/pi-deployment.md) for the Pi deployment path.
+See [docs/pi-deployment.md](/E:/_Data/_TUE/Prism/Codex web/docs/pi-deployment.md) for the Pi deployment flow and [docs/lab-bringup.md](/E:/_Data/_TUE/Prism/Codex web/docs/lab-bringup.md) for the first bench test checklist.

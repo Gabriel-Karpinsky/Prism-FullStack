@@ -11,7 +11,10 @@ class SerialTransport {
 
   bool Open();
   void Close();
+  void DrainInput();
   bool SendLine(const std::string& line);
+  bool ReadLine(std::string& line, int timeoutMs);
+  bool SendCommand(const std::string& line, std::string& response, int timeoutMs);
   bool IsOpen() const { return is_open_; }
   const std::string& last_error() const { return last_error_; }
 

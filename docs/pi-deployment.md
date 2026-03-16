@@ -1,6 +1,6 @@
 # Raspberry Pi Deployment
 
-This document describes the intended MVP deployment on the Raspberry Pi.
+This document describes the intended lab deployment on the Raspberry Pi.
 
 ## Runtime processes
 
@@ -24,20 +24,30 @@ The deployment files in `deploy/pi` assume that repository root.
 
 - edge daemon local API: `127.0.0.1:9090`
 - Go backend: `127.0.0.1:8080`
-- Tailscale Serve: HTTPS on the device's tailnet name, forwarding to `http://127.0.0.1:8080`
+- Tailscale Serve: HTTPS on the device tailnet name, forwarding to `http://127.0.0.1:8080`
 
 ## Recommended installation order
 
 1. Install Raspberry Pi OS, Docker, and Tailscale.
 2. Copy this repository to `/opt/cliffscanner`.
-3. Build and install the native edge daemon.
-4. Start the Go backend container with Docker Compose.
-5. Authenticate the host into your tailnet.
-6. Publish the backend with Tailscale Serve.
+3. Flash the Arduino Mega firmware and wire the step/dir drivers plus trigger line.
+4. Build and install the native edge daemon.
+5. Start the Go backend container with Docker Compose.
+6. Authenticate the host into your tailnet.
+7. Publish the backend with Tailscale Serve.
+
+## Arduino firmware assumptions
+
+Before first motion tests, verify:
+
+- the stepper driver DIP switches are physically set to `128` microsteps
+- pin assignments in [HardwareConfig.h](/E:/_Data/_TUE/Prism/Codex web/firmware/arduino-mega/include/HardwareConfig.h)
+- gear ratios and soft travel limits in [HardwareConfig.h](/E:/_Data/_TUE/Prism/Codex web/firmware/arduino-mega/include/HardwareConfig.h)
+- the Garmin trigger line is connected to the configured Arduino trigger pin if you are using that sync pulse
 
 ## Edge daemon
 
-The edge daemon is designed to be the sole hardware owner.
+The edge daemon is the sole hardware owner.
 
 Install it with:
 
@@ -51,10 +61,13 @@ Adjust `/etc/cliffscanner/edge-daemon.env` after the first install.
 Important environment values:
 
 - `EDGE_SERIAL_PORT=/dev/ttyACM0`
-- `EDGE_USE_SIMULATION=false` once the Arduino and lidar path are ready
+- `EDGE_USE_SIMULATION=false`
+- `EDGE_USE_MOCK_LIDAR=false`
 - `EDGE_ENABLE_SERIAL=true`
 - `EDGE_BIND_HOST=127.0.0.1`
 - `EDGE_BIND_PORT=9090`
+- `EDGE_LIDAR_BUS=1`
+- `EDGE_LIDAR_ADDRESS=98`
 
 ## Go backend container
 
@@ -97,6 +110,7 @@ This is the right default for a scanner with moving hardware.
 
 ## Current MVP caveats
 
-- the C++ edge daemon includes a mock lidar implementation today; it is ready for the Garmin v3HP driver to be dropped in behind the `LidarSensor` interface
-- the Arduino firmware still uses the temporary ASCII command bridge for motion commands
-- once the framed serial protocol is wired up, the edge daemon should switch to that binary transport instead of ASCII strings
+- `HOME` is currently a logical move-to-zero, not a limit-switch homing routine
+- the Garmin driver assumes the standard v3HP I2C address/register flow and should be bench-verified on your exact wiring
+- the Arduino soft limits and motion constants should be tuned against the real gantry before full-range scans
+- the edge daemon localhost API is intentionally minimal and meant only for the colocated Go backend

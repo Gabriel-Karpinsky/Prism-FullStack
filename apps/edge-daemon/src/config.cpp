@@ -44,11 +44,17 @@ Config LoadConfigFromEnv() {
   config.serial_baud = ReadEnvInt("EDGE_SERIAL_BAUD", config.serial_baud);
   config.simulate_hardware = ReadEnvBool("EDGE_USE_SIMULATION", config.simulate_hardware);
   config.enable_serial = ReadEnvBool("EDGE_ENABLE_SERIAL", config.enable_serial);
+  config.simulate_lidar = ReadEnvBool("EDGE_USE_MOCK_LIDAR", config.simulate_lidar);
   config.grid_width = ReadEnvInt("EDGE_GRID_WIDTH", config.grid_width);
   config.grid_height = ReadEnvInt("EDGE_GRID_HEIGHT", config.grid_height);
   config.lidar_bus = ReadEnvInt("EDGE_LIDAR_BUS", config.lidar_bus);
   config.lidar_address = ReadEnvInt("EDGE_LIDAR_ADDRESS", config.lidar_address);
   config.tick_interval_ms = ReadEnvInt("EDGE_TICK_INTERVAL_MS", config.tick_interval_ms);
+  config.status_poll_interval_ms = ReadEnvInt("EDGE_STATUS_POLL_INTERVAL_MS", config.status_poll_interval_ms);
+  config.heartbeat_interval_ms = ReadEnvInt("EDGE_HEARTBEAT_INTERVAL_MS", config.heartbeat_interval_ms);
+  config.command_timeout_ms = ReadEnvInt("EDGE_COMMAND_TIMEOUT_MS", config.command_timeout_ms);
+  config.move_settle_ms = ReadEnvInt("EDGE_MOVE_SETTLE_MS", config.move_settle_ms);
+  config.estimated_point_time_ms = ReadEnvInt("EDGE_ESTIMATED_POINT_TIME_MS", config.estimated_point_time_ms);
   return config;
 }
 

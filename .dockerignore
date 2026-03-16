@@ -2,5 +2,4 @@
 .gocache
 .gomodcache
 firmware/arduino-mega/.pio
-apps/prototype-server
 apps/edge-daemon/build

@@ -8,6 +8,7 @@ make
 sudo install -d /opt/cliffscanner/bin
 sudo install -m 0755 cliffscanner-edge /opt/cliffscanner/bin/cliffscanner-edge
 sudo install -d /etc/cliffscanner
+sudo install -d /var/lib/cliffscanner
 if [[ ! -f /etc/cliffscanner/edge-daemon.env ]]; then
   sudo install -m 0644 "$REPO_ROOT/deploy/pi/edge-daemon.env.example" /etc/cliffscanner/edge-daemon.env
 fi
