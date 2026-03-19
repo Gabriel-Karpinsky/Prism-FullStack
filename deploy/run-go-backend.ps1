@@ -1,7 +1,7 @@
 param(
     [int]$Port = 8080,
     [ValidateSet('sim','edge')]
-    [string]$Mode = 'sim',
+    [string]$Mode = 'edge',
     [string]$EdgeDaemonBaseUrl = 'http://127.0.0.1:9090'
 )
 
