@@ -65,6 +65,16 @@ class ScannerController {
     bool pulse_high = false;
     uint32_t pulse_low_deadline_us = 0;
     uint32_t next_step_due_us = 0;
+
+    AxisState() = default;
+    AxisState(uint8_t stepPin, uint8_t dirPin, float microstepsPerDegree, float minDeg, float maxDeg,
+              uint32_t stepIntervalUs)
+        : step_pin(stepPin),
+          dir_pin(dirPin),
+          microsteps_per_degree(microstepsPerDegree),
+          min_deg(minDeg),
+          max_deg(maxDeg),
+          step_interval_us(stepIntervalUs) {}
   };
 
   static constexpr uint8_t kFaultEStop = 0x01;
