@@ -1,21 +1,36 @@
 [Unit]
-Description=Cliff Scanner Edge Daemon
+Description=Cliff Scanner Edge Daemon (Pi-native hardware driver)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=simple
-User=pi
-Group=pi
-SupplementaryGroups=dialout i2c
+# pigpio uses DMA + /dev/mem, which requires root OR CAP_SYS_RAWIO; running as
+# root is the standard approach for pigpio on the Pi. The i2c group is kept so
+# /dev/i2c-1 (LIDAR) is reachable even if we later drop privileges.
+Type=notify
+NotifyAccess=main
+User=root
+Group=root
+SupplementaryGroups=i2c gpio
+
 EnvironmentFile=-/etc/cliffscanner/edge-daemon.env
+Environment=PRISM_HARDWARE_CONFIG=/etc/prism-scanner/hardware.json
+
 WorkingDirectory=/opt/cliffscanner
 ExecStart=/opt/cliffscanner/bin/cliffscanner-edge
+
+# systemd watchdog: the SafetySupervisor pings WATCHDOG=1 every 100 ms; if it
+# stops for >2 s the service is restarted (which releases GPIO and lets the
+# TB6600 ENABLE float, disabling the drivers as a fail-safe).
+WatchdogSec=2
 Restart=always
 RestartSec=2
+
+# Light hardening. ProtectSystem=full is the strongest we can afford while
+# still allowing pigpio's /dev/mem + /dev/gpiomem mappings.
 NoNewPrivileges=true
 ProtectSystem=full
-ReadWritePaths=/var/lib/cliffscanner
+ReadWritePaths=/var/lib/cliffscanner /etc/prism-scanner
 
 [Install]
 WantedBy=multi-user.target

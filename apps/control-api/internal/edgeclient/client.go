@@ -61,8 +61,60 @@ func (c *Client) Command(command string, payload map[string]any) (scanner.Snapsh
 	return response.State, nil
 }
 
+// MotionConfig fetches the current motion envelope from the edge daemon.
+func (c *Client) MotionConfig() (scanner.MotionConfig, error) {
+	var cfg scanner.MotionConfig
+	if err := c.getJSON("/api/config/motion", &cfg); err != nil {
+		return scanner.MotionConfig{}, err
+	}
+	return cfg, nil
+}
+
+// UpdateMotionConfig sends a PUT /api/config/motion. Either axis may be
+// omitted (the daemon merges the payload with the current config); we forward
+// the caller's struct verbatim. The daemon validates + persists atomically.
+func (c *Client) UpdateMotionConfig(cfg scanner.MotionConfig) (scanner.MotionConfig, error) {
+	var response struct {
+		OK     bool                 `json:"ok"`
+		Error  string               `json:"error"`
+		Motion scanner.MotionConfig `json:"motion"`
+	}
+	if err := c.putJSON("/api/config/motion", cfg, &response); err != nil {
+		return scanner.MotionConfig{}, err
+	}
+	if !response.OK && response.Error != "" {
+		return scanner.MotionConfig{}, fmt.Errorf("%s", response.Error)
+	}
+	return response.Motion, nil
+}
+
 func (c *Client) getJSON(path string, dst any) error {
 	response, err := c.http.Get(c.baseURL + path)
+	if err != nil {
+		return err
+	}
+	defer response.Body.Close()
+
+	if response.StatusCode >= 400 {
+		return decodeError(response)
+	}
+
+	return json.NewDecoder(response.Body).Decode(dst)
+}
+
+func (c *Client) putJSON(path string, body any, dst any) error {
+	payload, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest(http.MethodPut, c.baseURL+path, bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	response, err := c.http.Do(req)
 	if err != nil {
 		return err
 	}

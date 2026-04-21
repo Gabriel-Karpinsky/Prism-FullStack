@@ -25,6 +25,23 @@ type Metrics struct {
 	PacketsDropped int     `json:"packetsDropped"`
 }
 
+// AxisMotion mirrors the edge-daemon's per-axis motion envelope. Keys are
+// snake_case to match the wire format the daemon ships on /api/config/motion.
+type AxisMotion struct {
+	MinDeg        float64 `json:"min_deg"`
+	MaxDeg        float64 `json:"max_deg"`
+	MaxSpeedDegS  float64 `json:"max_speed_deg_s"`
+	AccelDegS2    float64 `json:"accel_deg_s2"`
+}
+
+// MotionConfig is the combined yaw/pitch envelope used by both GET and PUT
+// /api/config/motion. PUT accepts a partial payload (either axis may be
+// omitted); the edge daemon validates + persists atomically.
+type MotionConfig struct {
+	Yaw   AxisMotion `json:"yaw"`
+	Pitch AxisMotion `json:"pitch"`
+}
+
 type Snapshot struct {
 	Connected             bool            `json:"connected"`
 	Mode                  string          `json:"mode"`

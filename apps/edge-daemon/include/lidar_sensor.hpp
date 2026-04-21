@@ -1,9 +1,10 @@
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
-#include "config.hpp"
+#include "hardware_config.hpp"
 
 namespace edge {
 
@@ -29,7 +30,7 @@ class MockLidarSensor final : public LidarSensor {
 
 class GarminLidarLiteV3HPSensor final : public LidarSensor {
  public:
-  explicit GarminLidarLiteV3HPSensor(Config config);
+  explicit GarminLidarLiteV3HPSensor(LidarHardwareConfig config);
   ~GarminLidarLiteV3HPSensor() override;
 
   bool Initialize() override;
@@ -38,13 +39,13 @@ class GarminLidarLiteV3HPSensor final : public LidarSensor {
   const std::string& last_error() const override { return last_error_; }
 
  private:
-  bool WriteRegister(uint8_t reg, uint8_t value);
-  bool ReadRegister(uint8_t reg, uint8_t& value);
-  bool ReadRegister16(uint8_t reg, uint16_t& value);
+  bool WriteRegister(std::uint8_t reg, std::uint8_t value);
+  bool ReadRegister(std::uint8_t reg, std::uint8_t& value);
+  bool ReadRegister16(std::uint8_t reg, std::uint16_t& value);
   bool WaitForReady();
   void Close();
 
-  Config config_;
+  LidarHardwareConfig config_;
   std::string last_error_;
 #ifdef __linux__
   int fd_ = -1;
