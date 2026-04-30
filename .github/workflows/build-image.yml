@@ -161,17 +161,14 @@ jobs:
           cp deploy/image/customize.sh workspace/scripts/01-cliffscanner.sh
           chmod +x workspace/scripts/01-cliffscanner.sh
 
-          # The scripts execute inside the Raspberry Pi rootfs chroot. A
-          # Docker bind mount such as /repo is visible to the outer
-          # CustoPiZer container, but not automatically inside that chroot.
-          # Stage only the source material the image bake needs as a sibling
-          # of the script itself. CustoPiZer definitely exposes
-          # /CustoPiZer/workspace/scripts inside the chroot because that is
-          # where it executes scripts from.
-          rm -rf workspace/scripts/repo
-          mkdir -p workspace/scripts/repo
-          cp -a apps deploy docs workspace/scripts/repo/
-          find workspace/scripts/repo -maxdepth 1 -mindepth 1 -type d -print
+          # CustoPiZer exposes files staged below scripts/files inside the
+          # image build at /files. Keep the source payload there instead of
+          # relying on Docker bind mounts, which are only visible to the outer
+          # CustoPiZer container and not necessarily inside the chroot.
+          rm -rf workspace/scripts/files/repo
+          mkdir -p workspace/scripts/files/repo
+          cp -a apps deploy docs workspace/scripts/files/repo/
+          find workspace/scripts/files/repo -maxdepth 1 -mindepth 1 -type d -print
 
       - name: Run CustoPiZer (qemu-aarch64 chroot bake)
         # EDITBASE_ARCH defaults to armv7l, which would make qemu pick the
