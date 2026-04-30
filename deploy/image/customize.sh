@@ -22,11 +22,35 @@ export DEBIAN_FRONTEND=noninteractive
 # ---------------------------------------------------------------------------
 # 1. Packages
 # ---------------------------------------------------------------------------
+# Phase 1a — prerequisites needed to add Docker's apt repo. Debian Bookworm
+# does NOT ship docker-compose-plugin (and the docker.io package only gives
+# us the daemon, not the v2 compose plugin). The cliffscanner-control-api
+# systemd unit calls `docker compose ... up`, which is v2 subcommand syntax,
+# so we install the official Docker CE stack from Docker's own repo.
 apt-get update
 apt-get install -y --no-install-recommends \
-    build-essential pigpio libpigpio-dev nlohmann-json3-dev \
-    i2c-tools ca-certificates curl gnupg \
-    docker.io docker-compose-plugin
+    ca-certificates curl gnupg
+
+install -m 0755 -d /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/debian/gpg \
+    | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Bookworm-arm64. EDITBASE_ARCH is forced to aarch64 by the workflow so we
+# can hardcode arm64 here without sniffing dpkg.
+echo "deb [arch=arm64 signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/debian bookworm stable" \
+    > /etc/apt/sources.list.d/docker.list
+
+apt-get update
+
+# Phase 1b — everything we actually need on the device.
+apt-get install -y --no-install-recommends \
+    build-essential \
+    pigpio libpigpio-dev nlohmann-json3-dev \
+    i2c-tools \
+    docker-ce docker-ce-cli containerd.io \
+    docker-buildx-plugin docker-compose-plugin
 
 # ---------------------------------------------------------------------------
 # 2. Boot config: enable I²C bus 1 unconditionally.
