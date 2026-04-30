@@ -188,6 +188,7 @@ jobs:
 
       - name: Rename + compress final image
         run: |
+          sudo chown "$(id -u):$(id -g)" workspace/output.img
           mv workspace/output.img "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
           xz -T0 -9 -e "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
           ls -lh workspace/
