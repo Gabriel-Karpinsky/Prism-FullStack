@@ -9,7 +9,7 @@
 #   CLIFFSCANNER_VERSION     Version string written to /etc/cliffscanner/version
 #
 # Inputs (filesystem):
-#   /CustoPiZer/workspace/repo
+#   /CustoPiZer/workspace/scripts/repo
 #                            Staged project files copied by the workflow. This
 #                            path is visible inside the Pi rootfs chroot.
 #
@@ -19,7 +19,7 @@
 
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
-SOURCE_ROOT="${CLIFFSCANNER_SOURCE_ROOT:-/CustoPiZer/workspace/repo}"
+SOURCE_ROOT="${CLIFFSCANNER_SOURCE_ROOT:-/CustoPiZer/workspace/scripts/repo}"
 
 # ---------------------------------------------------------------------------
 # 1. Packages
