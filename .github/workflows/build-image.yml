@@ -143,9 +143,13 @@ jobs:
           mkdir -p workspace
           curl -fL --retry 3 -o workspace/raspios.img.xz "${RPIOS_URL}"
 
-      - name: Decompress base image
+      - name: Decompress base image to CustoPiZer's expected path
+        # CustoPiZer hard-codes the input filename as workspace/input.img and
+        # writes the result back to workspace/output.img. Renaming saves
+        # config faff inside the container.
         run: |
           xz -dk -T0 workspace/raspios.img.xz
+          mv workspace/raspios.img workspace/input.img
           ls -lh workspace/
 
       - name: Stage CustoPiZer scripts
@@ -157,20 +161,26 @@ jobs:
           cp deploy/image/customize.sh workspace/scripts/01-cliffscanner.sh
           chmod +x workspace/scripts/01-cliffscanner.sh
 
-      - name: Run CustoPiZer (qemu-arm64 chroot bake)
+      - name: Run CustoPiZer (qemu-aarch64 chroot bake)
+        # EDITBASE_ARCH defaults to armv7l, which would make qemu pick the
+        # 32-bit interpreter and chroot would refuse our arm64 base. Override
+        # to aarch64 so the 64-bit Raspberry Pi OS image mounts and runs.
+        # EDITBASE_IMAGE_ENLARGEROOT (in MiB) gives the chroot headroom for
+        # apt + the edge-daemon build + the docker pull; Pi OS Lite ships
+        # with ~1.5 GiB free which is too tight.
         run: |
-          # Bind-mount the repo at /repo inside the chroot. customize.sh
-          # reads from there and writes the final layout into the image.
           docker run --rm --privileged \
               -v "${PWD}/workspace:/CustoPiZer/workspace" \
               -v "${PWD}:/repo" \
+              -e EDITBASE_ARCH=aarch64 \
+              -e EDITBASE_IMAGE_ENLARGEROOT=2048 \
               -e CONTROL_API_IMAGE="${CONTROL_API_IMAGE}" \
               -e CLIFFSCANNER_VERSION="${VERSION}" \
               ghcr.io/octoprint/custopizer:latest
 
-      - name: Compress final image
+      - name: Rename + compress final image
         run: |
-          mv workspace/raspios.img "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
+          mv workspace/output.img "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
           xz -T0 -9 -e "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
           ls -lh workspace/
 
