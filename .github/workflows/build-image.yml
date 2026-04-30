@@ -161,6 +161,15 @@ jobs:
           cp deploy/image/customize.sh workspace/scripts/01-cliffscanner.sh
           chmod +x workspace/scripts/01-cliffscanner.sh
 
+          # The scripts execute inside the Raspberry Pi rootfs chroot. A
+          # Docker bind mount such as /repo is visible to the outer
+          # CustoPiZer container, but not automatically inside that chroot.
+          # Stage only the source material the image bake needs into the
+          # workspace, which CustoPiZer does expose as /CustoPiZer/workspace.
+          rm -rf workspace/repo
+          mkdir -p workspace/repo
+          cp -a apps deploy docs workspace/repo/
+
       - name: Run CustoPiZer (qemu-aarch64 chroot bake)
         # EDITBASE_ARCH defaults to armv7l, which would make qemu pick the
         # 32-bit interpreter and chroot would refuse our arm64 base. Override
@@ -171,7 +180,6 @@ jobs:
         run: |
           docker run --rm --privileged \
               -v "${PWD}/workspace:/CustoPiZer/workspace" \
-              -v "${PWD}:/repo" \
               -e EDITBASE_ARCH=aarch64 \
               -e EDITBASE_IMAGE_ENLARGEROOT=2048 \
               -e CONTROL_API_IMAGE="${CONTROL_API_IMAGE}" \

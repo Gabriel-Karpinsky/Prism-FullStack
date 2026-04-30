@@ -9,8 +9,9 @@
 #   CLIFFSCANNER_VERSION     Version string written to /etc/cliffscanner/version
 #
 # Inputs (filesystem):
-#   /repo                    The project repo root (bind-mounted by the workflow).
-#                            We treat this as read-only source material.
+#   /CustoPiZer/workspace/repo
+#                            Staged project files copied by the workflow. This
+#                            path is visible inside the Pi rootfs chroot.
 #
 # Anything that needs the *real* hardware (MAC-derived hostname, Tailscale
 # auth) deferred to /usr/local/sbin/cliffscanner-firstboot. This script must
@@ -18,6 +19,7 @@
 
 set -euxo pipefail
 export DEBIAN_FRONTEND=noninteractive
+SOURCE_ROOT="${CLIFFSCANNER_SOURCE_ROOT:-/CustoPiZer/workspace/repo}"
 
 # ---------------------------------------------------------------------------
 # 1. Packages
@@ -72,9 +74,9 @@ systemctl disable pigpiod || true
 # 3. Source tree -> /opt/cliffscanner
 # ---------------------------------------------------------------------------
 install -d /opt/cliffscanner
-cp -r /repo/apps   /opt/cliffscanner/
-cp -r /repo/deploy /opt/cliffscanner/
-cp -r /repo/docs   /opt/cliffscanner/
+cp -r "${SOURCE_ROOT}/apps"   /opt/cliffscanner/
+cp -r "${SOURCE_ROOT}/deploy" /opt/cliffscanner/
+cp -r "${SOURCE_ROOT}/docs"   /opt/cliffscanner/
 
 # ---------------------------------------------------------------------------
 # 4. Build the C++ edge daemon under qemu (slow but correct).
@@ -112,7 +114,8 @@ fi
 # Stage the docker-compose.yml. If we successfully baked the image, rewrite
 # it to use that local tag; otherwise leave the GHCR ref so first-boot pulls.
 install -d /opt/cliffscanner/deploy/pi
-cp /repo/deploy/pi/docker-compose.yml /opt/cliffscanner/deploy/pi/docker-compose.yml
+install -d /etc/cliffscanner
+cp "${SOURCE_ROOT}/deploy/pi/docker-compose.yml" /opt/cliffscanner/deploy/pi/docker-compose.yml
 
 if [ "$PRELOAD_OK" = "1" ]; then
     # Replace the build: stanza with image: cliffscanner-control-api:baked
@@ -128,7 +131,6 @@ else
         -e '/^\s*context:/d' \
         -e '/^\s*dockerfile:/d' \
         /opt/cliffscanner/deploy/pi/docker-compose.yml
-    install -d /etc/cliffscanner
     echo "ghcr-pull-on-first-boot" > /etc/cliffscanner/control-api-source
 fi
 
@@ -136,19 +138,19 @@ fi
 # 6. Config seeds.
 # ---------------------------------------------------------------------------
 install -d /etc/cliffscanner /etc/prism-scanner /var/lib/cliffscanner
-install -m 0644 /repo/deploy/pi/edge-daemon.env.example \
+install -m 0644 "${SOURCE_ROOT}/deploy/pi/edge-daemon.env.example" \
                 /etc/cliffscanner/edge-daemon.env
-install -m 0644 /repo/deploy/pi/hardware.json.example \
+install -m 0644 "${SOURCE_ROOT}/deploy/pi/hardware.json.example" \
                 /etc/prism-scanner/hardware.json
 
 # ---------------------------------------------------------------------------
 # 7. Systemd units.
 # ---------------------------------------------------------------------------
-install -m 0644 /repo/deploy/pi/cliffscanner-edge.service \
+install -m 0644 "${SOURCE_ROOT}/deploy/pi/cliffscanner-edge.service" \
                 /etc/systemd/system/cliffscanner-edge.service
-install -m 0644 /repo/deploy/pi/cliffscanner-control-api.service \
+install -m 0644 "${SOURCE_ROOT}/deploy/pi/cliffscanner-control-api.service" \
                 /etc/systemd/system/cliffscanner-control-api.service
-install -m 0644 /repo/deploy/image/cliffscanner-firstboot.service \
+install -m 0644 "${SOURCE_ROOT}/deploy/image/cliffscanner-firstboot.service" \
                 /etc/systemd/system/cliffscanner-firstboot.service
 
 systemctl enable cliffscanner-edge.service
@@ -171,7 +173,7 @@ systemctl disable tailscaled || true
 # ---------------------------------------------------------------------------
 # 9. First-boot script + version stamp.
 # ---------------------------------------------------------------------------
-install -m 0755 /repo/deploy/image/first-boot.sh \
+install -m 0755 "${SOURCE_ROOT}/deploy/image/first-boot.sh" \
                 /usr/local/sbin/cliffscanner-firstboot
 echo "${CLIFFSCANNER_VERSION:-unknown}" > /etc/cliffscanner/version
 
