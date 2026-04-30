@@ -4,6 +4,59 @@ Pi-native bring-up. There is no microcontroller in the motion path — the Pi
 drives the TB6600 drivers directly via `pigpio` DMA waveforms and reads the
 LIDAR over I²C.
 
+## Two paths
+
+1. **Flash the pre-baked image** (recommended). Zero on-device setup beyond
+   wiring. Skip to ["Image flash path"](#image-flash-path).
+2. **Build from source on a running Pi.** Useful when iterating on the daemon
+   itself. See ["Build-from-source path"](#build-from-source-path).
+
+## Image flash path
+
+1. Grab the latest release `.img.xz` from
+   <https://github.com/Gabriel-Karpinsky/Prism-FullStack/releases>
+   (file: `cliffscanner-pi-aarch64-vX.Y.Z.img.xz`).
+2. (Optional, for remote access) Generate a Tailscale auth key at
+   <https://login.tailscale.com/admin/settings/keys>. A reusable, ephemeral,
+   pre-authorised key is the safest choice — it auto-expires and can't be
+   replayed off the SD card.
+3. Flash with **Raspberry Pi Imager**:
+   - "Choose OS" → "Use custom" → select the `.img.xz`.
+   - "Choose Storage" → your SD card.
+   - "Settings" cog → enable SSH, set username/password, set WiFi SSID +
+     password if needed. Imager writes these into the image at flash time
+     so you don't have to bake credentials into the release.
+4. After flashing finishes, **before** ejecting the card, drop the auth key:
+   ```
+   echo "tskey-auth-...your-key..." > /Volumes/bootfs/tailscale-authkey
+   ```
+   (On Windows, the boot partition shows up as a drive letter; create a file
+   named `tailscale-authkey` with the key inside.)
+5. Insert the card into the Pi, power on. First boot:
+   - Resizes the root filesystem to fill the SD card (Raspberry Pi OS default).
+   - Sets the hostname to `cliffscanner-XXXXXX` (last 6 hex of eth0 MAC).
+   - If `tailscale-authkey` is present: joins the tailnet with `--ssh`,
+     then shreds the key file.
+   - Starts `cliffscanner-edge` and `cliffscanner-control-api`.
+6. Find the device in your Tailscale admin console (or local LAN); SSH in
+   and run the smoke checks below.
+
+### Smoke checks
+
+```bash
+systemctl is-active cliffscanner-edge        # active
+systemctl is-active cliffscanner-control-api # active
+curl -s http://127.0.0.1:9090/health         # {"ok":true}
+curl -s http://127.0.0.1:8080/healthz        # {"ok":true}
+cat /etc/cliffscanner/version                 # matches release tag
+journalctl -u cliffscanner-firstboot --no-pager
+```
+
+If something looks wrong, the rest of this doc covers the build-from-source
+path so you can rebuild any one component on the device.
+
+## Build-from-source path
+
 ## Runtime processes
 
 - `cliffscanner-edge` — native systemd service, owns GPIO + I²C.

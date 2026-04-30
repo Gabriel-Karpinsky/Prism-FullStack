@@ -1,58 +1,71 @@
 # Cliff Face Scanner MVP
 
-This repository contains a deployable MVP stack for the cliff-face scanner.
+A 2-axis cliff-face scanner controlled from a browser. Pi-native: a single
+Raspberry Pi 4B drives two TB6600 stepper drivers via pigpio DMA waveforms,
+reads a Garmin LIDAR-Lite v3HP over I²C, and serves the operator UI.
 
-The intended lab deployment is:
+## Quickstart (flash + power on)
 
-- Arduino Mega for deterministic yaw/pitch motion control and Garmin trigger output
-- Raspberry Pi native C++ edge daemon for Arduino serial control, Garmin LIDAR-Lite v3HP reads, and scan orchestration
-- Go control API in Docker on the Raspberry Pi
-- Browser UI served directly by the Go backend
-- Tailscale on the Raspberry Pi host for remote operator access when the lab network blocks local connections
+1. Download the latest pre-baked image:
+   <https://github.com/Gabriel-Karpinsky/Prism-FullStack/releases/latest>
+   (file: `cliffscanner-pi-aarch64-vX.Y.Z.img.xz`).
+2. Flash with **Raspberry Pi Imager** → "Use custom image". Set SSH/WiFi via
+   Imager's customisation pane (Ctrl-Shift-X).
+3. (Optional) Drop a Tailscale auth key at `/boot/firmware/tailscale-authkey`
+   on the SD card before ejecting; first boot joins the tailnet and shreds
+   the file.
+4. Power on. After ~90 seconds: SSH in, hit `http://<pi>:8080`, control the
+   scanner.
+
+Full flash-path docs in [docs/pi-deployment.md](docs/pi-deployment.md).
+Wiring in [docs/hardware-pins.md](docs/hardware-pins.md).
 
 ## Repository layout
 
-- `apps/control-api`: Go backend that serves the browser UI and operator API
-- `apps/edge-daemon`: native C++ Raspberry Pi service that owns the Arduino and lidar hardware path
-- `apps/web-ui`: dependency-free browser UI
-- `firmware/arduino-mega`: Arduino Mega firmware for dual step/dir control and trigger output
-- `proto/scanner/v1`: future protobuf contract if the localhost JSON boundary is later upgraded
-- `deploy/pi`: Raspberry Pi deployment assets for systemd, Docker Compose, and Tailscale
-- `docs`: architecture, packaging, protocol, and Pi deployment notes
+- `apps/edge-daemon` — native C++ service owning all GPIO + I²C. pigpio DMA
+  waveforms for stepper timing, Garmin v3HP reads, scan state machine,
+  systemd watchdog integration.
+- `apps/control-api` — Go backend serving the operator UI and brokering the
+  single-operator control lease. Proxies to the edge daemon over localhost.
+- `apps/web-ui` — dependency-free browser UI.
+- `deploy/pi` — systemd units, env examples, install scripts for manual
+  bring-up.
+- `deploy/image` — provisioning script + first-boot service consumed by the
+  GitHub Actions image-build workflow.
+- `.github/workflows/build-image.yml` — turns a tag push into a flashable
+  `.img.xz` via CustoPiZer + qemu-arm64.
+- `docs` — architecture, hardware pinout, deployment notes.
 
-## Current MVP behavior
+## Local development (no Pi required)
 
-Implemented now:
+The edge-daemon's GPIO backend has a mock implementation for host builds:
 
-- Arduino firmware drives two stepper axes through external step/dir drivers at 128 microstepping
-- Arduino exposes a line-based serial command/status protocol with heartbeat watchdog and trigger output
-- edge daemon sequences raster scans as `move -> settle -> trigger -> read lidar -> commit cell`
-- Garmin LIDAR-Lite v3HP reads are implemented on the Pi over Linux I2C with a mock fallback for bench work
-- Go backend runs in Docker and talks to the edge daemon over localhost
-- Tailscale is the intended remote access path for lab operation
+```bash
+cd apps/edge-daemon && make    # HAS_PIGPIO unset → mock backend
+./cliffscanner-edge            # listens on 127.0.0.1:9090
+```
 
-Important assumptions to verify in the lab:
-
-- Arduino pin assignments in [HardwareConfig.h](/E:/_Data/_TUE/Prism/Codex web/firmware/arduino-mega/include/HardwareConfig.h)
-- stepper driver DIP switches are physically set to `128` microsteps
-- gear ratios in [HardwareConfig.h](/E:/_Data/_TUE/Prism/Codex web/firmware/arduino-mega/include/HardwareConfig.h) match the gantry mechanics
-- Garmin wiring and I2C bus/address match [edge-daemon.env.example](/E:/_Data/_TUE/Prism/Codex web/deploy/pi/edge-daemon.env.example)
-
-## Local development
-
-Run the Go backend against the in-process simulator:
+Or run the Go backend against its built-in sim service:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\deploy\run-go-backend.ps1 -Port 8080
 ```
 
-## Raspberry Pi deployment target
+Browse to `http://localhost:8080`.
 
-The intended MVP host layout on the Raspberry Pi is:
+## Cutting a release
 
-- native service: `cliffscanner-edge`
-- Docker container: `control-api`
-- Tailscale host service: `tailscaled`
-- Tailscale Serve publishes `https://<pi-hostname>.<tailnet>.ts.net` to `http://127.0.0.1:8080`
+```bash
+git tag v0.1.0
+git push --tags
+```
 
-See [docs/pi-deployment.md](/E:/_Data/_TUE/Prism/Codex web/docs/pi-deployment.md) for the Pi deployment flow and [docs/lab-bringup.md](/E:/_Data/_TUE/Prism/Codex web/docs/lab-bringup.md) for the first bench test checklist.
+This triggers `.github/workflows/build-image.yml`, which:
+
+1. Cross-compiles the control-api container and pushes it to GHCR
+   (`ghcr.io/gabriel-karpinsky/cliffscanner-control-api:v0.1.0`).
+2. Bakes that container into a Raspberry Pi OS Lite image via CustoPiZer.
+3. Attaches the resulting `.img.xz` to a GitHub Release.
+
+Expect 18–25 min end-to-end. The first run also needs the GHCR package set
+to public visibility — see the comment block at the top of the workflow file.
