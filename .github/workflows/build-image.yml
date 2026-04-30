@@ -1,0 +1,183 @@
+# Build a turn-key Raspberry Pi 4B SD-card image.
+#
+# Two stages:
+#   1. build-control-api: cross-compile + push a multi-arch container image
+#      to GHCR. The Pi-image bake then docker-pulls this into the chroot's
+#      local cache so the device has zero internet dependency for the
+#      control-api at first boot.
+#   2. build-pi-image: take the latest Raspberry Pi OS Lite 64-bit, run
+#      deploy/image/customize.sh inside a qemu-arm64 chroot via CustoPiZer,
+#      compress the result, and (on tag push) attach it to a Release.
+#
+# One-time setup the repo owner must do:
+#   - After the first GHCR push, set the package visibility to PUBLIC at
+#     https://github.com/users/Gabriel-Karpinsky/packages/container/cliffscanner-control-api/settings
+#     Otherwise `docker pull` inside the chroot will 401.
+#
+# Triggering:
+#   - Push a tag like `v0.1.0` -> full release with the .img.xz attached.
+#   - Manual run from the Actions UI -> uploads the artifact for download
+#     but doesn't create a Release.
+
+name: build-pi-image
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Override version string (defaults to short SHA)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # softprops/action-gh-release needs this on tag push
+  packages: write   # docker push to GHCR
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/cliffscanner-control-api
+  # Pin a known-good Pi OS Lite 64-bit. Bump this every ~6 months — the URL
+  # 404s when Raspberry Pi rotates the release. See "Risks" in the plan doc.
+  RPIOS_URL: https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64-lite.img.xz
+
+jobs:
+  build-control-api:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.value }}
+      image_ref: ${{ steps.version.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: version
+        run: |
+          if [ -n "${{ inputs.version }}" ]; then
+            v="${{ inputs.version }}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            v="${GITHUB_REF_NAME}"
+          else
+            v="dev-$(echo "${GITHUB_SHA}" | cut -c1-7)"
+          fi
+          echo "value=${v}"                          >> "$GITHUB_OUTPUT"
+          echo "image_ref=${GHCR_IMAGE}:${v}"        >> "$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push control-api (linux/arm64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/control-api/Dockerfile
+          platforms: linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.version.outputs.value }}
+          tags: |
+            ${{ steps.version.outputs.image_ref }}
+            ${{ env.GHCR_IMAGE }}:latest
+          # Layer cache lives in the same registry — no external cache infra.
+          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
+          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
+
+  build-pi-image:
+    needs: build-control-api
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.build-control-api.outputs.version }}
+      CONTROL_API_IMAGE: ${{ needs.build-control-api.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install qemu binfmt + xz
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              qemu-user-static binfmt-support xz-utils
+          # Re-register binfmt in case the runner image lacks arm64 entry.
+          docker run --rm --privileged multiarch/qemu-user-static --reset -p yes
+
+      - name: Cache Raspberry Pi OS base image
+        id: cache-rpios
+        uses: actions/cache@v4
+        with:
+          path: workspace/raspios.img.xz
+          key: rpios-${{ hashFiles('.github/workflows/build-image.yml') }}
+
+      - name: Download Raspberry Pi OS Lite 64-bit
+        if: steps.cache-rpios.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p workspace
+          curl -fL --retry 3 -o workspace/raspios.img.xz "${RPIOS_URL}"
+
+      - name: Decompress base image
+        run: |
+          xz -dk -T0 workspace/raspios.img.xz
+          ls -lh workspace/
+
+      - name: Stage CustoPiZer scripts
+        run: |
+          # CustoPiZer runs every script in /CustoPiZer/workspace/scripts/ in
+          # lexical order. Numbered prefix locks ordering even if more scripts
+          # are added later.
+          mkdir -p workspace/scripts
+          cp deploy/image/customize.sh workspace/scripts/01-cliffscanner.sh
+          chmod +x workspace/scripts/01-cliffscanner.sh
+
+      - name: Run CustoPiZer (qemu-arm64 chroot bake)
+        run: |
+          # Bind-mount the repo at /repo inside the chroot. customize.sh
+          # reads from there and writes the final layout into the image.
+          docker run --rm --privileged \
+              -v "${PWD}/workspace:/CustoPiZer/workspace" \
+              -v "${PWD}:/repo" \
+              -e CONTROL_API_IMAGE="${CONTROL_API_IMAGE}" \
+              -e CLIFFSCANNER_VERSION="${VERSION}" \
+              ghcr.io/octoprint/custopizer:latest
+
+      - name: Compress final image
+        run: |
+          mv workspace/raspios.img "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
+          xz -T0 -9 -e "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
+          ls -lh workspace/
+
+      - name: Compute checksums
+        run: |
+          cd workspace
+          sha256sum "cliffscanner-pi-aarch64-${VERSION}.img.xz" \
+              > "cliffscanner-pi-aarch64-${VERSION}.img.xz.sha256"
+
+      - name: Upload artifact (workflow_dispatch + tag both)
+        uses: actions/upload-artifact@v4
+        with:
+          name: cliffscanner-pi-aarch64-${{ env.VERSION }}
+          path: |
+            workspace/cliffscanner-pi-aarch64-*.img.xz
+            workspace/cliffscanner-pi-aarch64-*.img.xz.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Attach to GitHub Release (tag pushes only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            workspace/cliffscanner-pi-aarch64-*.img.xz
+            workspace/cliffscanner-pi-aarch64-*.img.xz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true

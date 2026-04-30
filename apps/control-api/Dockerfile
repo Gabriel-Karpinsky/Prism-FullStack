@@ -6,6 +6,17 @@ COPY apps/control-api/internal ./internal
 RUN go build -o /out/control-api ./cmd/server
 
 FROM debian:bookworm-slim
+
+# OCI labels — used by GHCR to auto-link the package to the source repo so
+# `docker pull ghcr.io/.../cliffscanner-control-api` works without an explicit
+# package-visibility tweak. VERSION is interpolated from the build-arg passed
+# by the GitHub Actions workflow (defaults to "dev" for local builds).
+ARG VERSION=dev
+LABEL org.opencontainers.image.source="https://github.com/Gabriel-Karpinsky/Prism-FullStack"
+LABEL org.opencontainers.image.description="Cliff Scanner control-api (Go) — proxies to the Pi-native edge daemon"
+LABEL org.opencontainers.image.licenses="MIT"
+LABEL org.opencontainers.image.version="${VERSION}"
+
 RUN useradd --create-home --shell /usr/sbin/nologin scanner
 WORKDIR /app
 COPY --from=build /out/control-api /usr/local/bin/control-api

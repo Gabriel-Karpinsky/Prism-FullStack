@@ -10,6 +10,8 @@ import (
 type HardwareClient interface {
 	Snapshot() (Snapshot, error)
 	Command(command string, payload map[string]any) (Snapshot, error)
+	MotionConfig() (MotionConfig, error)
+	UpdateMotionConfig(MotionConfig) (MotionConfig, error)
 }
 
 type EdgeService struct {
@@ -117,6 +119,30 @@ func (s *EdgeService) Command(user, command string, payload map[string]any) (Sna
 	s.lastSnapshot = snapshot
 	s.lastError = ""
 	return s.decorateSnapshotLocked(snapshot, nil), nil
+}
+
+// MotionConfig proxies GET /api/config/motion on the edge daemon.
+func (s *EdgeService) MotionConfig() (MotionConfig, error) {
+	return s.client.MotionConfig()
+}
+
+// UpdateMotionConfig is lease-gated: only the current control owner may
+// reshape the motion envelope. The edge daemon itself validates + persists;
+// we only mediate who's allowed to call through.
+func (s *EdgeService) UpdateMotionConfig(user string, cfg MotionConfig) (MotionConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.requireControlLocked(strings.TrimSpace(user)); err != nil {
+		return MotionConfig{}, err
+	}
+
+	applied, err := s.client.UpdateMotionConfig(cfg)
+	if err != nil {
+		return MotionConfig{}, err
+	}
+	s.addLocalLogLocked("config", "info", strings.TrimSpace(user)+" updated motion envelope.")
+	return applied, nil
 }
 
 func (s *EdgeService) syncHardwareLocked() error {

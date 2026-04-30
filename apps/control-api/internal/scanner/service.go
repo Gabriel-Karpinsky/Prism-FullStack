@@ -34,6 +34,7 @@ type state struct {
 	metrics             Metrics
 	faults              []string
 	activity            []ActivityEntry
+	motionConfig        MotionConfig
 }
 
 type Service struct {
@@ -65,6 +66,11 @@ func NewService() *Service {
 			},
 			faults:   []string{},
 			activity: []ActivityEntry{},
+			motionConfig: MotionConfig{
+				// Matches the edge-daemon defaults (hardware_config.cpp).
+				Yaw:   AxisMotion{MinDeg: -50, MaxDeg: 50, MaxSpeedDegS: 18, AccelDegS2: 60},
+				Pitch: AxisMotion{MinDeg: -30, MaxDeg: 30, MaxSpeedDegS: 12, AccelDegS2: 40},
+			},
 		},
 	}
 
@@ -230,6 +236,57 @@ func (s *Service) Command(user, command string, payload map[string]any) (Snapsho
 
 	s.updateLocked()
 	return s.snapshotLocked(), nil
+}
+
+// MotionConfig returns the in-memory sim envelope. Matches the edge service
+// shape so the HTTP handler is agnostic to which backend is active.
+func (s *Service) MotionConfig() (MotionConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.state.motionConfig, nil
+}
+
+// UpdateMotionConfig validates the envelope and stores it. Lease-gated so the
+// sim service behaves the same way as the edge-backed one.
+func (s *Service) UpdateMotionConfig(user string, cfg MotionConfig) (MotionConfig, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.requireControlLocked(strings.TrimSpace(user)); err != nil {
+		return MotionConfig{}, err
+	}
+	if err := validateMotionConfig(cfg); err != nil {
+		return MotionConfig{}, err
+	}
+	s.state.motionConfig = cfg
+	s.state.scanSettings.YawMin = cfg.Yaw.MinDeg
+	s.state.scanSettings.YawMax = cfg.Yaw.MaxDeg
+	s.state.scanSettings.PitchMin = cfg.Pitch.MinDeg
+	s.state.scanSettings.PitchMax = cfg.Pitch.MaxDeg
+	s.addLog("config", "info", strings.TrimSpace(user)+" updated motion envelope.")
+	return cfg, nil
+}
+
+func validateMotionConfig(cfg MotionConfig) error {
+	if cfg.Yaw.MaxDeg <= cfg.Yaw.MinDeg {
+		return errors.New("yaw.max_deg must be greater than min_deg")
+	}
+	if cfg.Yaw.MaxSpeedDegS <= 0 {
+		return errors.New("yaw.max_speed_deg_s must be positive")
+	}
+	if cfg.Yaw.AccelDegS2 <= 0 {
+		return errors.New("yaw.accel_deg_s2 must be positive")
+	}
+	if cfg.Pitch.MaxDeg <= cfg.Pitch.MinDeg {
+		return errors.New("pitch.max_deg must be greater than min_deg")
+	}
+	if cfg.Pitch.MaxSpeedDegS <= 0 {
+		return errors.New("pitch.max_speed_deg_s must be positive")
+	}
+	if cfg.Pitch.AccelDegS2 <= 0 {
+		return errors.New("pitch.accel_deg_s2 must be positive")
+	}
+	return nil
 }
 
 func (s *Service) updateLocked() {

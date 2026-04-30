@@ -18,6 +18,8 @@ type apiService interface {
 	Acquire(user string) (scanner.Snapshot, error)
 	Release(user string) (scanner.Snapshot, error)
 	Command(user, command string, payload map[string]any) (scanner.Snapshot, error)
+	MotionConfig() (scanner.MotionConfig, error)
+	UpdateMotionConfig(user string, cfg scanner.MotionConfig) (scanner.MotionConfig, error)
 }
 
 type acquireRequest struct {
@@ -28,6 +30,14 @@ type commandRequest struct {
 	User    string         `json:"user"`
 	Command string         `json:"command"`
 	Payload map[string]any `json:"payload"`
+}
+
+// motionConfigRequest is the PUT payload for /api/config/motion. User is
+// required so the sim service can honour the same lease semantics as the
+// edge-backed service. Motion carries the envelope itself.
+type motionConfigRequest struct {
+	User   string               `json:"user"`
+	Motion scanner.MotionConfig `json:"motion"`
 }
 
 func main() {
@@ -116,6 +126,34 @@ func main() {
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "state": snapshot})
+	})
+
+	// Motion envelope: read is public (so the UI can render current limits on
+	// load without acquiring the lease); write is lease-gated by the service.
+	mux.HandleFunc("/api/config/motion", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case http.MethodGet:
+			cfg, err := service.MotionConfig()
+			if err != nil {
+				writeJSON(w, http.StatusBadGateway, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, cfg)
+		case http.MethodPut:
+			var req motionConfigRequest
+			if err := decodeJSON(r, &req); err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+				return
+			}
+			cfg, err := service.UpdateMotionConfig(req.User, req.Motion)
+			if err != nil {
+				writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+				return
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "motion": cfg})
+		default:
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method not allowed."})
+		}
 	})
 
 	log.Printf("Go control API listening on http://%s\n", listenAddr)

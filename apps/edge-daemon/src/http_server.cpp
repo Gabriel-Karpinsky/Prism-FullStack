@@ -1,17 +1,35 @@
+// Minimal single-threaded HTTP/1.1 server for the edge-daemon control plane.
+// Shared with the Go control-api over localhost. Requests are small JSON
+// payloads; we trade throughput for zero external dependencies beyond
+// nlohmann-json (already required by hardware_config).
+//
+// Endpoints:
+//   GET  /health                -> {"ok":true}
+//   GET  /api/hardware/state    -> Snapshot JSON (camelCase, matches Go client)
+//   POST /api/hardware/command  -> {command, axis?, delta?, resolution?} -> {ok, state, error?}
+//   GET  /api/config            -> full effective Config (snake_case)
+//   GET  /api/config/motion     -> {yaw, pitch} motion envelope
+//   PUT  /api/config/motion     -> accepts {yaw?, pitch?}; validates + persists to disk
+
 #include "http_server.hpp"
 
 #include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <cstdint>
 #include <cstring>
-#include <optional>
 #include <regex>
 #include <sstream>
 #include <string>
-#include <vector>
+
+#include <nlohmann/json.hpp>
+
+#include "edge_daemon.hpp"
 
 #ifdef __linux__
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -19,269 +37,256 @@
 namespace edge {
 namespace {
 
+using json = nlohmann::json;
+
 struct Request {
   std::string method;
   std::string path;
   std::string body;
 };
 
-std::string EscapeJson(const std::string& value) {
-  std::string out;
-  out.reserve(value.size() + 8);
-  for (char c : value) {
-    switch (c) {
-      case '\\': out += "\\\\"; break;
-      case '"': out += "\\\""; break;
-      case '\n': out += "\\n"; break;
-      case '\r': out += "\\r"; break;
-      case '\t': out += "\\t"; break;
-      default: out += c; break;
-    }
-  }
-  return out;
+json AxisToJson(const AxisMotion& a) {
+  return json{
+      {"min_deg", a.min_deg},
+      {"max_deg", a.max_deg},
+      {"max_speed_deg_s", a.max_speed_deg_s},
+      {"accel_deg_s2", a.accel_deg_s2},
+  };
 }
 
-std::string FormatDouble(double value) {
-  std::ostringstream out;
-  out.setf(std::ios::fixed, std::ios::floatfield);
-  out.precision(4);
-  out << value;
-  std::string text = out.str();
-  while (!text.empty() && text.back() == '0') text.pop_back();
-  if (!text.empty() && text.back() == '.') text.pop_back();
-  if (text.empty()) return "0";
-  return text;
+bool ReadAxis(const json& node, AxisMotion& out) {
+  if (!node.is_object()) return false;
+  try {
+    if (node.contains("min_deg"))         out.min_deg         = node.at("min_deg").get<double>();
+    if (node.contains("max_deg"))         out.max_deg         = node.at("max_deg").get<double>();
+    if (node.contains("max_speed_deg_s")) out.max_speed_deg_s = node.at("max_speed_deg_s").get<double>();
+    if (node.contains("accel_deg_s2"))    out.accel_deg_s2    = node.at("accel_deg_s2").get<double>();
+    return true;
+  } catch (...) {
+    return false;
+  }
 }
 
-std::string ActivityToJson(const ActivityEntry& entry) {
-  std::ostringstream out;
-  out << "{"
-      << "\"source\":\"" << EscapeJson(entry.source) << "\"," 
-      << "\"ts\":\"" << EscapeJson(entry.ts) << "\"," 
-      << "\"message\":\"" << EscapeJson(entry.message) << "\"," 
-      << "\"level\":\"" << EscapeJson(entry.level) << "\""
-      << "}";
-  return out.str();
+json ActivityToJson(const ActivityEntry& e) {
+  return json{
+      {"source", e.source},
+      {"ts", e.ts},
+      {"message", e.message},
+      {"level", e.level},
+  };
 }
 
-std::string SnapshotToJson(const Snapshot& snapshot) {
-  std::ostringstream out;
-  out << "{";
-  out << "\"connected\":" << (snapshot.connected ? "true" : "false") << ",";
-  out << "\"mode\":\"" << EscapeJson(snapshot.mode) << "\",";
-  out << "\"controlOwner\":\"\",";
-  out << "\"controlLeaseExpiresAt\":null,";
-  out << "\"yaw\":" << FormatDouble(snapshot.yaw) << ",";
-  out << "\"pitch\":" << FormatDouble(snapshot.pitch) << ",";
-  out << "\"coverage\":" << FormatDouble(snapshot.coverage) << ",";
-  out << "\"scanProgress\":" << FormatDouble(snapshot.scan_progress) << ",";
-  out << "\"scanDurationSeconds\":" << FormatDouble(snapshot.scan_duration_seconds) << ",";
-  if (snapshot.last_completed_scan_at.has_value()) {
-    out << "\"lastCompletedScanAt\":\"" << EscapeJson(*snapshot.last_completed_scan_at) << "\",";
-  } else {
-    out << "\"lastCompletedScanAt\":null,";
-  }
-  out << "\"scanSettings\":{";
-  out << "\"yawMin\":" << FormatDouble(snapshot.scan_settings.yaw_min) << ",";
-  out << "\"yawMax\":" << FormatDouble(snapshot.scan_settings.yaw_max) << ",";
-  out << "\"pitchMin\":" << FormatDouble(snapshot.scan_settings.pitch_min) << ",";
-  out << "\"pitchMax\":" << FormatDouble(snapshot.scan_settings.pitch_max) << ",";
-  out << "\"sweepSpeedDegPerSec\":" << FormatDouble(snapshot.scan_settings.sweep_speed_deg_per_sec) << ",";
-  out << "\"resolution\":\"" << EscapeJson(snapshot.scan_settings.resolution) << "\"";
-  out << "},";
-  out << "\"metrics\":{";
-  out << "\"motorTempC\":" << FormatDouble(snapshot.metrics.motor_temp_c) << ",";
-  out << "\"motorCurrentA\":" << FormatDouble(snapshot.metrics.motor_current_a) << ",";
-  out << "\"lidarFps\":" << snapshot.metrics.lidar_fps << ",";
-  out << "\"radarFps\":" << snapshot.metrics.radar_fps << ",";
-  out << "\"latencyMs\":" << snapshot.metrics.latency_ms << ",";
-  out << "\"packetsDropped\":" << snapshot.metrics.packets_dropped;
-  out << "},";
-  out << "\"faults\":[";
-  for (size_t i = 0; i < snapshot.faults.size(); ++i) {
-    if (i > 0) out << ",";
-    out << "\"" << EscapeJson(snapshot.faults[i]) << "\"";
-  }
-  out << "],";
-  out << "\"activity\":[";
-  for (size_t i = 0; i < snapshot.activity.size(); ++i) {
-    if (i > 0) out << ",";
-    out << ActivityToJson(snapshot.activity[i]);
-  }
-  out << "],";
-  out << "\"grid\":[";
-  for (size_t y = 0; y < snapshot.grid.size(); ++y) {
-    if (y > 0) out << ",";
-    out << "[";
-    for (size_t x = 0; x < snapshot.grid[y].size(); ++x) {
-      if (x > 0) out << ",";
-      out << FormatDouble(snapshot.grid[y][x]);
-    }
-    out << "]";
-  }
-  out << "]";
-  out << "}";
-  return out.str();
-}
+json SnapshotToJson(const Snapshot& s) {
+  json activity = json::array();
+  for (const auto& a : s.activity) activity.push_back(ActivityToJson(a));
 
-std::string Envelope(bool ok, const Snapshot& snapshot, const std::string& error) {
-  std::ostringstream out;
-  out << "{";
-  if (!error.empty()) {
-    out << "\"error\":\"" << EscapeJson(error) << "\",";
-  }
-  out << "\"ok\":" << (ok ? "true" : "false") << ",";
-  out << "\"state\":" << SnapshotToJson(snapshot);
-  out << "}";
-  return out.str();
-}
-
-std::optional<std::string> ExtractString(const std::string& json, const std::string& key) {
-  const std::regex pattern("\\\"" + key + "\\\"\\s*:\\s*\\\"([^\\\"]*)\\\"");
-  std::smatch match;
-  if (std::regex_search(json, match, pattern) && match.size() > 1) {
-    return match[1].str();
-  }
-  return std::nullopt;
-}
-
-std::optional<double> ExtractNumber(const std::string& json, const std::string& key) {
-  const std::regex pattern("\\\"" + key + "\\\"\\s*:\\s*(-?[0-9]+(?:\\.[0-9]+)?)");
-  std::smatch match;
-  if (std::regex_search(json, match, pattern) && match.size() > 1) {
-    return std::stod(match[1].str());
-  }
-  return std::nullopt;
+  json root = {
+      {"connected", s.connected},
+      {"mode", s.mode},
+      {"controlOwner", s.control_owner},
+      {"yaw", s.yaw},
+      {"pitch", s.pitch},
+      {"coverage", s.coverage},
+      {"scanProgress", s.scan_progress},
+      {"scanDurationSeconds", s.scan_duration_seconds},
+      {"scanSettings", {
+          {"yawMin",             s.scan_settings.yaw_min},
+          {"yawMax",             s.scan_settings.yaw_max},
+          {"pitchMin",           s.scan_settings.pitch_min},
+          {"pitchMax",           s.scan_settings.pitch_max},
+          {"sweepSpeedDegPerSec", s.scan_settings.sweep_speed_deg_per_sec},
+          {"resolution",         s.scan_settings.resolution},
+      }},
+      {"metrics", {
+          {"motorTempC",     s.metrics.motor_temp_c},
+          {"motorCurrentA",  s.metrics.motor_current_a},
+          {"lidarFps",       s.metrics.lidar_fps},
+          {"radarFps",       s.metrics.radar_fps},
+          {"latencyMs",      s.metrics.latency_ms},
+          {"packetsDropped", s.metrics.packets_dropped},
+      }},
+      {"faults", s.faults},
+      {"activity", activity},
+      {"grid", s.grid},
+  };
+  root["lastCompletedScanAt"]   = s.last_completed_scan_at.has_value()
+                                      ? json(*s.last_completed_scan_at) : json(nullptr);
+  root["controlLeaseExpiresAt"] = s.control_lease_expires_at.has_value()
+                                      ? json(*s.control_lease_expires_at) : json(nullptr);
+  return root;
 }
 
 Request ParseRequest(const std::string& raw) {
-  Request request;
+  Request req;
   const auto line_end = raw.find("\r\n");
-  if (line_end == std::string::npos) {
-    return request;
-  }
+  if (line_end == std::string::npos) return req;
 
-  const std::string request_line = raw.substr(0, line_end);
-  std::istringstream line_stream(request_line);
-  line_stream >> request.method >> request.path;
+  std::istringstream line_stream(raw.substr(0, line_end));
+  line_stream >> req.method >> req.path;
 
   const auto header_end = raw.find("\r\n\r\n");
-  if (header_end != std::string::npos) {
-    request.body = raw.substr(header_end + 4);
-  }
-  return request;
+  if (header_end != std::string::npos) req.body = raw.substr(header_end + 4);
+  return req;
 }
 
-std::string MakeHttpResponse(int status_code, const std::string& status_text, const std::string& body) {
+std::string MakeResponse(int code, const std::string& status_text, const std::string& body) {
   std::ostringstream out;
-  out << "HTTP/1.1 " << status_code << " " << status_text << "\r\n";
-  out << "Content-Type: application/json; charset=utf-8\r\n";
-  out << "Cache-Control: no-store\r\n";
-  out << "Content-Length: " << body.size() << "\r\n";
-  out << "Connection: close\r\n\r\n";
-  out << body;
+  out << "HTTP/1.1 " << code << ' ' << status_text << "\r\n"
+      << "Content-Type: application/json; charset=utf-8\r\n"
+      << "Cache-Control: no-store\r\n"
+      << "Content-Length: " << body.size() << "\r\n"
+      << "Connection: close\r\n\r\n"
+      << body;
   return out.str();
 }
 
 }  // namespace
 
-HttpServer::HttpServer(Config config, EdgeDaemon& daemon)
-    : config_(std::move(config)), daemon_(daemon) {}
+HttpServer::HttpServer(ServiceConfig service, EdgeDaemon& daemon)
+    : service_(std::move(service)), daemon_(daemon) {}
+
+void HttpServer::RequestShutdown() { shutdown_.store(true); }
 
 int HttpServer::Run() {
 #ifdef __linux__
-  const int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (server_fd < 0) {
-    return 1;
-  }
+  const int server_fd = ::socket(AF_INET, SOCK_STREAM, 0);
+  if (server_fd < 0) return 1;
 
   int opt = 1;
-  setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+  ::setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
   sockaddr_in addr{};
   addr.sin_family = AF_INET;
-  addr.sin_port = htons(static_cast<uint16_t>(config_.bind_port));
-  if (inet_pton(AF_INET, config_.bind_host.c_str(), &addr.sin_addr) <= 0) {
-    close(server_fd);
+  addr.sin_port = htons(static_cast<std::uint16_t>(service_.bind_port));
+  if (::inet_pton(AF_INET, service_.bind_host.c_str(), &addr.sin_addr) <= 0) {
+    ::close(server_fd);
+    return 1;
+  }
+  if (::bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
+    ::close(server_fd);
+    return 1;
+  }
+  if (::listen(server_fd, 16) < 0) {
+    ::close(server_fd);
     return 1;
   }
 
-  if (bind(server_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) < 0) {
-    close(server_fd);
-    return 1;
-  }
+  while (!shutdown_.load()) {
+    pollfd pfd{server_fd, POLLIN, 0};
+    const int ready = ::poll(&pfd, 1, 500);  // periodic wakeup to observe shutdown_
+    if (ready <= 0) continue;
 
-  if (listen(server_fd, 16) < 0) {
-    close(server_fd);
-    return 1;
-  }
-
-  while (true) {
-    const int client_fd = accept(server_fd, nullptr, nullptr);
-    if (client_fd < 0) {
-      continue;
-    }
+    const int client_fd = ::accept(server_fd, nullptr, nullptr);
+    if (client_fd < 0) continue;
 
     std::string raw;
     char buffer[4096];
     while (true) {
-      const ssize_t count = recv(client_fd, buffer, sizeof(buffer), 0);
-      if (count <= 0) {
-        break;
-      }
-      raw.append(buffer, static_cast<size_t>(count));
-      if (raw.find("\r\n\r\n") != std::string::npos) {
-        const auto header_end = raw.find("\r\n\r\n");
-        const std::string headers = raw.substr(0, header_end);
-        std::smatch match;
-        std::regex length_pattern("Content-Length:\\s*([0-9]+)", std::regex_constants::icase);
-        size_t expected_body = 0;
-        if (std::regex_search(headers, match, length_pattern) && match.size() > 1) {
-          expected_body = static_cast<size_t>(std::stoul(match[1].str()));
-        }
-        if (raw.size() >= header_end + 4 + expected_body) {
-          break;
-        }
-      }
+      const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer), 0);
+      if (n <= 0) break;
+      raw.append(buffer, static_cast<std::size_t>(n));
+      const auto hend = raw.find("\r\n\r\n");
+      if (hend == std::string::npos) continue;
+      std::smatch m;
+      std::regex cl_re("Content-Length:\\s*([0-9]+)", std::regex_constants::icase);
+      std::size_t expected = 0;
+      const std::string headers = raw.substr(0, hend);
+      if (std::regex_search(headers, m, cl_re)) expected = std::stoul(m[1].str());
+      if (raw.size() >= hend + 4 + expected) break;
     }
 
-    const Request request = ParseRequest(raw);
-    std::string body;
-    int status_code = 200;
+    const Request req = ParseRequest(raw);
+    int code = 200;
     std::string status_text = "OK";
+    std::string body;
 
-    if (request.method == "GET" && request.path == "/health") {
-      body = "{\"ok\":true}";
-    } else if (request.method == "GET" && request.path == "/api/hardware/state") {
-      body = SnapshotToJson(daemon_.GetSnapshot());
-    } else if (request.method == "POST" && request.path == "/api/hardware/command") {
-      CommandRequest command;
-      command.command = ExtractString(request.body, "command").value_or("");
-      command.axis = ExtractString(request.body, "axis").value_or("");
-      command.delta = ExtractNumber(request.body, "delta").value_or(0.0);
-      command.resolution = ExtractString(request.body, "resolution").value_or("");
+    try {
+      if (req.method == "GET" && req.path == "/health") {
+        body = json{{"ok", true}}.dump();
 
-      std::string error_message;
-      const Snapshot snapshot = daemon_.ExecuteCommand(command, error_message);
-      if (!error_message.empty()) {
-        status_code = 409;
-        status_text = "Conflict";
-        body = Envelope(false, snapshot, error_message);
+      } else if (req.method == "GET" && req.path == "/api/hardware/state") {
+        body = SnapshotToJson(daemon_.GetSnapshot()).dump();
+
+      } else if (req.method == "POST" && req.path == "/api/hardware/command") {
+        CommandRequest command;
+        const auto payload = req.body.empty() ? json::object() : json::parse(req.body);
+        command.command    = payload.value("command",    std::string{});
+        command.axis       = payload.value("axis",       std::string{});
+        command.delta      = payload.value("delta",      0.0);
+        command.resolution = payload.value("resolution", std::string{});
+
+        std::string err;
+        const Snapshot snap = daemon_.ExecuteCommand(command, err);
+        json env = {{"ok", err.empty()}, {"state", SnapshotToJson(snap)}};
+        if (!err.empty()) {
+          env["error"] = err;
+          code = 409;
+          status_text = "Conflict";
+        }
+        body = env.dump();
+
+      } else if (req.method == "GET" && req.path == "/api/config") {
+        const Config c = daemon_.GetConfig();
+        body = json{
+            {"motion", {
+                {"yaw",   AxisToJson(c.motion.yaw)},
+                {"pitch", AxisToJson(c.motion.pitch)},
+            }},
+            {"mechanics", {
+                {"full_steps_per_rev", c.mechanics.full_steps_per_rev},
+                {"microsteps",         c.mechanics.microsteps},
+                {"yaw_gear_ratio",     c.mechanics.yaw_gear_ratio},
+                {"pitch_gear_ratio",   c.mechanics.pitch_gear_ratio},
+            }},
+            {"service", {
+                {"bind_host",   c.service.bind_host},
+                {"bind_port",   c.service.bind_port},
+                {"grid_width",  c.service.grid_width},
+                {"grid_height", c.service.grid_height},
+            }},
+            {"simulate_hardware", c.simulate_hardware},
+            {"config_file_path",  c.config_file_path},
+        }.dump();
+
+      } else if (req.method == "GET" && req.path == "/api/config/motion") {
+        const MotionConfig m = daemon_.GetMotionConfig();
+        body = json{{"yaw", AxisToJson(m.yaw)}, {"pitch", AxisToJson(m.pitch)}}.dump();
+
+      } else if (req.method == "PUT" && req.path == "/api/config/motion") {
+        MotionConfig proposed = daemon_.GetMotionConfig();
+        const auto payload = req.body.empty() ? json::object() : json::parse(req.body);
+        if (payload.contains("yaw")   && !ReadAxis(payload["yaw"],   proposed.yaw))
+          throw std::runtime_error("yaw payload invalid");
+        if (payload.contains("pitch") && !ReadAxis(payload["pitch"], proposed.pitch))
+          throw std::runtime_error("pitch payload invalid");
+
+        const std::string err = daemon_.UpdateMotionConfig(proposed);
+        if (!err.empty()) {
+          code = 400; status_text = "Bad Request";
+          body = json{{"ok", false}, {"error", err}}.dump();
+        } else {
+          const MotionConfig applied = daemon_.GetMotionConfig();
+          body = json{
+              {"ok", true},
+              {"motion", {{"yaw", AxisToJson(applied.yaw)}, {"pitch", AxisToJson(applied.pitch)}}},
+          }.dump();
+        }
+
       } else {
-        body = Envelope(true, snapshot, "");
+        code = 404; status_text = "Not Found";
+        body = json{{"error", "Not found."}}.dump();
       }
-    } else {
-      status_code = 404;
-      status_text = "Not Found";
-      body = "{\"error\":\"Not found.\"}";
+    } catch (const std::exception& e) {
+      code = 400; status_text = "Bad Request";
+      body = json{{"error", std::string("bad request: ") + e.what()}}.dump();
     }
 
-    const std::string response = MakeHttpResponse(status_code, status_text, body);
-    send(client_fd, response.data(), response.size(), 0);
-    close(client_fd);
+    const std::string response = MakeResponse(code, status_text, body);
+    ::send(client_fd, response.data(), response.size(), MSG_NOSIGNAL);
+    ::close(client_fd);
   }
 
-  close(server_fd);
+  ::close(server_fd);
   return 0;
 #else
   return 1;

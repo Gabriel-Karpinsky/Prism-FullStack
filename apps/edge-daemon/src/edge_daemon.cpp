@@ -1,3 +1,20 @@
+// EdgeDaemon: top-level orchestration of the Pi-native hardware stack.
+//
+// Responsibilities:
+//   * Own the GPIO backend, LIDAR sensor, MotionController and SafetySupervisor.
+//   * Maintain a thread-safe Snapshot that the HTTP layer serialises for the Go
+//     control-api. Position (yaw/pitch) is resolved lazily from MotionController
+//     at snapshot time so it always reflects the latest committed state.
+//   * Run the scan state machine on a dedicated worker thread. The worker
+//     calls MotionController::MoveTo synchronously (blocks until the pigpio
+//     DMA waveform completes or is aborted), pulses the LIDAR trigger and
+//     records the cell. Pause/resume are cooperative; stop_scan and estop
+//     trigger motion aborts.
+//
+// Lock discipline: mutex_ guards state_ and scan_state_. Never held across
+// motion_->MoveTo or lidar_->ReadDistanceMeters calls — those may block for
+// many milliseconds, and HTTP reads of GetSnapshot must remain responsive.
+
 #include "edge_daemon.hpp"
 
 #include <algorithm>
@@ -5,9 +22,7 @@
 #include <cmath>
 #include <ctime>
 #include <iomanip>
-#include <limits>
 #include <sstream>
-#include <thread>
 #include <utility>
 
 namespace edge {
@@ -16,543 +31,485 @@ namespace {
 std::string CurrentTimestamp() {
   using clock = std::chrono::system_clock;
   const auto now = clock::now();
-  const std::time_t now_time = clock::to_time_t(now);
-  std::tm tm_utc{};
+  const std::time_t t = clock::to_time_t(now);
+  std::tm utc{};
 #ifdef _WIN32
-  gmtime_s(&tm_utc, &now_time);
+  gmtime_s(&utc, &t);
 #else
-  gmtime_r(&now_time, &tm_utc);
+  gmtime_r(&t, &utc);
 #endif
-
   std::ostringstream out;
-  out << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");
+  out << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
   return out.str();
 }
 
-bool StartsWith(const std::string& value, const std::string& prefix) {
-  return value.rfind(prefix, 0) == 0;
-}
-
-std::string FormatCommandFloat(double value) {
-  std::ostringstream out;
-  out.setf(std::ios::fixed, std::ios::floatfield);
-  out.precision(2);
-  out << value;
-  return out.str();
-}
+double Clamp(double v, double lo, double hi) { return std::max(lo, std::min(v, hi)); }
+double Round(double v, double scale)         { return std::round(v * scale) / scale; }
 
 }  // namespace
 
 EdgeDaemon::EdgeDaemon(Config config) : config_(std::move(config)) {
-  serial_ = std::make_unique<SerialTransport>(config_.serial_port, config_.serial_baud);
-  lidar_ = CreateLidarSensor(config_);
+  gpio_   = CreateGpioBackend(config_);
+  lidar_  = CreateLidarSensor(config_);
+  motion_ = std::make_unique<MotionController>(config_, *gpio_);
+  safety_ = std::make_unique<SafetySupervisor>(config_, *motion_);
+
+  // The scan-grid soft limits default to the motion envelope. Operators can
+  // tighten them at runtime; widening beyond the motion envelope is bounded
+  // by MotionController itself when planning moves.
+  state_.scan_settings.yaw_min   = config_.motion.yaw.min_deg;
+  state_.scan_settings.yaw_max   = config_.motion.yaw.max_deg;
+  state_.scan_settings.pitch_min = config_.motion.pitch.min_deg;
+  state_.scan_settings.pitch_max = config_.motion.pitch.max_deg;
+  state_.scan_settings.sweep_speed_deg_per_sec =
+      std::min(config_.motion.yaw.max_speed_deg_s, config_.motion.pitch.max_speed_deg_s);
+
   ApplyResolutionLocked(state_.scan_settings.resolution);
   ResetScanLocked();
 
-  AddLogLocked("system", "info", "Edge daemon initialized.");
-  AddLogLocked("sensor", "info", std::string("Lidar source set to ") + lidar_->Name() + ".");
+  AddLogLocked("system", "info", "Edge daemon initialised.");
+  AddLogLocked("motion", "info", std::string("GPIO backend: ") + gpio_->Name() + ".");
+  AddLogLocked("sensor", "info", std::string("Lidar source: ") + lidar_->Name() + ".");
 }
 
 EdgeDaemon::~EdgeDaemon() { Stop(); }
 
 bool EdgeDaemon::Start() {
-  std::scoped_lock lock(mutex_);
-  if (running_) {
-    return true;
-  }
+  {
+    std::scoped_lock lock(mutex_);
+    if (running_) return true;
 
-  if (!lidar_->Initialize()) {
-    state_.faults = {"Failed to initialize lidar sensor: " + lidar_->last_error()};
-    AddLogLocked("sensor", "error", state_.faults.front());
-  }
-
-  if (!config_.simulate_hardware && config_.enable_serial) {
-    if (!serial_->Open()) {
+    std::string err;
+    if (!gpio_->Initialize(err)) {
       state_.connected = false;
-      state_.faults = {"Unable to open Arduino serial port: " + serial_->last_error()};
+      state_.faults = {"GPIO backend init failed: " + err};
       AddLogLocked("motion", "error", state_.faults.front());
-    } else {
-      state_.connected = true;
-      AddLogLocked("motion", "info", "Arduino serial link opened.");
-      RefreshHardwareStateLocked();
+      return false;
     }
-  } else {
-    state_.connected = true;
-    AddLogLocked("motion", "info", "Running with simulated motion transport.");
-  }
+    if (!lidar_->Initialize()) {
+      // Lidar failure isn't fatal at boot — the scan worker surfaces it per-cell.
+      AddLogLocked("sensor", "warn", "Lidar init warning: " + lidar_->last_error());
+    }
 
-  const auto now = std::chrono::steady_clock::now();
-  last_status_poll_at_ = now - std::chrono::milliseconds(config_.status_poll_interval_ms);
-  last_heartbeat_at_ = now - std::chrono::milliseconds(config_.heartbeat_interval_ms);
-  last_move_issued_at_ = now;
-  running_ = true;
-  worker_ = std::thread(&EdgeDaemon::RunLoop, this);
+    state_.connected = true;
+    running_ = true;
+    AddLogLocked("system", "info", "Edge daemon running.");
+  }
+  motion_->SetEnabled(true);
+  safety_->Start();
   return true;
 }
 
 void EdgeDaemon::Stop() {
-  running_ = false;
-  if (worker_.joinable()) {
-    worker_.join();
+  bool was_running = false;
+  {
+    std::scoped_lock lock(mutex_);
+    was_running = running_.exchange(false);
+    if (scan_state_ != ScanState::Idle) scan_state_ = ScanState::Stopping;
   }
-  if (serial_) {
-    serial_->Close();
-  }
+  scan_cv_.notify_all();
+  if (motion_) motion_->AbortMotion();
+  if (scan_worker_.joinable()) scan_worker_.join();
+  if (safety_) safety_->Stop();
+  if (motion_ && was_running) motion_->SetEnabled(false);
+  if (gpio_   && was_running) gpio_->Shutdown();
+}
+
+bool EdgeDaemon::Healthy() const {
+  return running_.load() && safety_ && !safety_->faulted();
 }
 
 Snapshot EdgeDaemon::GetSnapshot() const {
   std::scoped_lock lock(mutex_);
-  return state_;
+  Snapshot s = state_;
+  s.yaw   = Round(motion_->yaw_deg(),   100.0);
+  s.pitch = Round(motion_->pitch_deg(), 100.0);
+
+  const FaultCode code = safety_->fault_code();
+  if (code != FaultCode::None) {
+    const std::string tag = std::string(FaultCodeName(code)) + ": " + safety_->fault_reason();
+    if (s.faults.empty() || s.faults.front() != tag) {
+      s.faults.insert(s.faults.begin(), tag);
+    }
+    s.mode = "fault";
+    s.connected = false;
+  }
+  return s;
+}
+
+Config EdgeDaemon::GetConfig() const {
+  std::scoped_lock lock(mutex_);
+  Config c = config_;
+  c.motion = motion_->motion_config();
+  return c;
+}
+
+MotionConfig EdgeDaemon::GetMotionConfig() const { return motion_->motion_config(); }
+
+std::string EdgeDaemon::UpdateMotionConfig(const MotionConfig& motion) {
+  if (auto err = ValidateMotionConfig(motion); !err.empty()) return err;
+
+  // Hot-apply requires the current physical position to already lie inside the
+  // new envelope; otherwise the next move would immediately clamp and lurch.
+  const double yaw   = motion_->yaw_deg();
+  const double pitch = motion_->pitch_deg();
+  if (yaw < motion.yaw.min_deg || yaw > motion.yaw.max_deg) {
+    return "current yaw is outside the proposed envelope; home the gantry first";
+  }
+  if (pitch < motion.pitch.min_deg || pitch > motion.pitch.max_deg) {
+    return "current pitch is outside the proposed envelope; home the gantry first";
+  }
+
+  motion_->SetMotionConfig(motion);
+
+  std::scoped_lock lock(mutex_);
+  config_.motion = motion;
+  state_.scan_settings.yaw_min   = motion.yaw.min_deg;
+  state_.scan_settings.yaw_max   = motion.yaw.max_deg;
+  state_.scan_settings.pitch_min = motion.pitch.min_deg;
+  state_.scan_settings.pitch_max = motion.pitch.max_deg;
+  state_.scan_settings.sweep_speed_deg_per_sec =
+      std::min(motion.yaw.max_speed_deg_s, motion.pitch.max_speed_deg_s);
+  AddLogLocked("config", "info", "Motion envelope updated.");
+
+  if (!config_.config_file_path.empty()) {
+    try {
+      SaveConfigToFile(config_, config_.config_file_path);
+    } catch (const std::exception& e) {
+      AddLogLocked("config", "warn", std::string("Persist failed: ") + e.what());
+      // Applied in-memory; persistence failure is non-fatal.
+    }
+  }
+  return {};
 }
 
 Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& error_message) {
-  std::scoped_lock lock(mutex_);
   error_message.clear();
+  safety_->Heartbeat();
 
-  const std::string command = request.command;
-  const bool using_simulation = config_.simulate_hardware || !config_.enable_serial;
+  const std::string& cmd = request.command;
 
-  if (command == "connect") {
-    if (!using_simulation && !serial_->IsOpen() && !serial_->Open()) {
-      error_message = "Unable to open Arduino serial port: " + serial_->last_error();
-      FailHardwareLocked(error_message);
-      return state_;
+  // ESTOP and clear_fault are always accepted, even while the system is faulted.
+  if (cmd == "estop") {
+    safety_->TriggerEStop("operator e-stop");
+    std::thread prev;
+    {
+      std::scoped_lock lock(mutex_);
+      state_.mode = "fault";
+      if (state_.faults.empty()) state_.faults = {"Emergency stop asserted."};
+      if (scan_state_ != ScanState::Idle) {
+        scan_state_ = ScanState::Stopping;
+        prev = std::move(scan_worker_);
+      }
+      AddLogLocked("safety", "error", "Emergency stop triggered.");
     }
+    scan_cv_.notify_all();
+    if (prev.joinable()) prev.join();
+    return GetSnapshot();
+  }
 
+  if (cmd == "clear_fault") {
+    safety_->ClearFault();
+    std::scoped_lock lock(mutex_);
+    state_.faults.clear();
+    state_.mode = "idle";
     state_.connected = true;
-    if (!using_simulation && !RefreshHardwareStateLocked()) {
-      error_message = "Unable to query Arduino status after connect.";
-    }
-    AddLogLocked("motion", "info", "Hardware transport connected.");
+    scan_state_ = ScanState::Idle;
+    AddLogLocked("safety", "info", "Fault cleared.");
+    motion_->SetEnabled(true);
     return state_;
   }
 
-  if (!state_.faults.empty() && command != "clear_fault" && command != "estop") {
-    error_message = "Clear the fault before issuing this command.";
+  if (safety_->faulted()) {
+    error_message = "Clear the fault before issuing commands.";
+    std::scoped_lock lock(mutex_);
     return state_;
   }
 
-  if (command == "set_resolution") {
-    if (state_.mode == "scanning" || state_.mode == "paused") {
+  if (cmd == "connect") {
+    std::scoped_lock lock(mutex_);
+    state_.connected = true;
+    AddLogLocked("motion", "info", "Connect acknowledged.");
+    return state_;
+  }
+
+  if (cmd == "set_resolution") {
+    std::scoped_lock lock(mutex_);
+    if (scan_state_ != ScanState::Idle) {
       error_message = "Stop the current scan before changing resolution.";
       return state_;
     }
-    ApplyResolutionLocked(request.resolution.empty() ? state_.scan_settings.resolution : request.resolution);
+    ApplyResolutionLocked(request.resolution.empty() ? state_.scan_settings.resolution
+                                                     : request.resolution);
     AddLogLocked("scanner", "info", "Scan resolution set to " + state_.scan_settings.resolution + ".");
     return state_;
   }
 
-  std::string response;
-  if (command == "home") {
-    if (!SendArduinoCommandLocked("HOME", response)) {
-      error_message = response;
-      FailHardwareLocked(error_message);
-      return state_;
+  if (cmd == "home") {
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ != ScanState::Idle) {
+        error_message = "Stop the current scan before homing.";
+        return state_;
+      }
+      state_.mode = "manual";
+      AddLogLocked("motion", "info", "Homing to (0, 0).");
     }
-    state_.mode = "manual";
-    if (using_simulation) {
-      state_.yaw = 0.0;
-      state_.pitch = 0.0;
+    const auto result = motion_->Home();
+    std::scoped_lock lock(mutex_);
+    if (!result.success) {
+      error_message = "Home failed: " + result.error;
+      FailLocked(error_message);
     } else {
-      RefreshHardwareStateLocked();
+      state_.mode = "idle";
     }
-    AddLogLocked("motion", "info", "Gantry moving to home position.");
     return state_;
   }
 
-  if (command == "jog") {
+  if (cmd == "jog") {
     if (request.axis != "yaw" && request.axis != "pitch") {
       error_message = "Unsupported jog axis.";
+      std::scoped_lock lock(mutex_);
       return state_;
     }
-    const std::string line = "JOG " + request.axis + " " + FormatCommandFloat(request.delta);
-    if (!SendArduinoCommandLocked(line, response)) {
-      error_message = response;
-      FailHardwareLocked(error_message);
-      return state_;
-    }
-    state_.mode = "manual";
-    if (using_simulation) {
-      if (request.axis == "yaw") {
-        state_.yaw = Clamp(state_.yaw + request.delta, state_.scan_settings.yaw_min, state_.scan_settings.yaw_max);
-      } else {
-        state_.pitch = Clamp(state_.pitch + request.delta, state_.scan_settings.pitch_min, state_.scan_settings.pitch_max);
+    double target_yaw;
+    double target_pitch;
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ != ScanState::Idle) {
+        error_message = "Stop the current scan before jogging.";
+        return state_;
       }
+      target_yaw   = motion_->yaw_deg();
+      target_pitch = motion_->pitch_deg();
+      if (request.axis == "yaw") target_yaw   += request.delta;
+      else                       target_pitch += request.delta;
+      state_.mode = "manual";
+      AddLogLocked("motion", "info", std::string("Jog ") + request.axis + ".");
+    }
+    const auto result = motion_->MoveTo(target_yaw, target_pitch);
+    std::scoped_lock lock(mutex_);
+    if (!result.success) {
+      error_message = "Jog failed: " + result.error;
+      FailLocked(error_message);
     } else {
-      RefreshHardwareStateLocked();
+      state_.mode = "idle";
     }
-    AddLogLocked("motion", "info", "Jogged " + request.axis + ".");
     return state_;
   }
 
-  if (command == "start_scan") {
-    if (!SendArduinoCommandLocked("START_SCAN", response)) {
-      error_message = response;
-      FailHardwareLocked(error_message);
-      return state_;
+  if (cmd == "start_scan") {
+    std::thread old_worker;
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ != ScanState::Idle) {
+        error_message = "Stop the current scan before starting a new one.";
+        return state_;
+      }
+      // scan_state_ == Idle implies the worker (if any) has already exited;
+      // reap it before launching a fresh one.
+      old_worker = std::move(scan_worker_);
+      ResetScanLocked();
+      scan_state_ = ScanState::Scanning;
+      state_.mode = "scanning";
+      AddLogLocked("scanner", "info", "Scan started.");
     }
-    ResetScanLocked();
-    state_.mode = "scanning";
-    current_scan_index_ = 0;
-    scan_waiting_for_settle_ = false;
-    hardware_moving_ = false;
-    AddLogLocked("scanner", "info", "Scan started.");
-    return state_;
+    if (old_worker.joinable()) old_worker.join();
+    scan_worker_ = std::thread(&EdgeDaemon::ScanWorker, this);
+    return GetSnapshot();
   }
 
-  if (command == "pause_scan") {
-    if (!SendArduinoCommandLocked("PAUSE_SCAN", response)) {
-      error_message = response;
-      FailHardwareLocked(error_message);
+  if (cmd == "pause_scan") {
+    std::scoped_lock lock(mutex_);
+    if (scan_state_ != ScanState::Scanning) {
+      error_message = "No scan in progress.";
       return state_;
     }
+    // Cooperative pause: the worker finishes the current cell, then parks on
+    // the condition variable until resume_scan. Motion is NOT aborted, so
+    // position tracking stays consistent across pause/resume.
+    scan_state_ = ScanState::Paused;
     state_.mode = "paused";
-    scan_waiting_for_settle_ = false;
-    hardware_moving_ = false;
     AddLogLocked("scanner", "warn", "Scan paused.");
     return state_;
   }
 
-  if (command == "resume_scan") {
-    if (!SendArduinoCommandLocked("RESUME_SCAN", response)) {
-      error_message = response;
-      FailHardwareLocked(error_message);
-      return state_;
+  if (cmd == "resume_scan") {
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ != ScanState::Paused) {
+        error_message = "Scan is not paused.";
+        return state_;
+      }
+      scan_state_ = ScanState::Scanning;
+      state_.mode = "scanning";
+      AddLogLocked("scanner", "info", "Scan resumed.");
     }
-    state_.mode = "scanning";
-    scan_waiting_for_settle_ = false;
-    hardware_moving_ = false;
-    AddLogLocked("scanner", "info", "Scan resumed.");
-    return state_;
+    scan_cv_.notify_all();
+    return GetSnapshot();
   }
 
-  if (command == "stop_scan") {
-    if (!SendArduinoCommandLocked("STOP_SCAN", response)) {
-      error_message = response;
-      FailHardwareLocked(error_message);
-      return state_;
+  if (cmd == "stop_scan") {
+    std::thread prev;
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ == ScanState::Idle) {
+        error_message = "No scan in progress.";
+        return state_;
+      }
+      scan_state_ = ScanState::Stopping;
+      state_.mode = "idle";
+      prev = std::move(scan_worker_);
+      AddLogLocked("scanner", "warn", "Scan stopped.");
     }
-    state_.mode = "idle";
-    scan_waiting_for_settle_ = false;
-    hardware_moving_ = false;
-    AddLogLocked("scanner", "warn", "Scan stopped.");
-    return state_;
+    motion_->AbortMotion();
+    scan_cv_.notify_all();
+    if (prev.joinable()) prev.join();
+    return GetSnapshot();
   }
 
-  if (command == "estop") {
-    if (!SendArduinoCommandLocked("ESTOP", response)) {
-      error_message = response;
-    }
-    state_.mode = "fault";
-    state_.faults = {"Emergency stop asserted."};
-    scan_waiting_for_settle_ = false;
-    hardware_moving_ = false;
-    AddLogLocked("safety", "error", "Emergency stop triggered.");
-    return state_;
-  }
-
-  if (command == "clear_fault") {
-    if (!SendArduinoCommandLocked("CLEAR_FAULT", response)) {
-      error_message = response;
-      return state_;
-    }
-    state_.faults.clear();
-    state_.mode = "idle";
-    hardware_moving_ = false;
-    scan_waiting_for_settle_ = false;
-    AddLogLocked("safety", "info", "Fault state cleared.");
-    if (!using_simulation) {
-      RefreshHardwareStateLocked();
-    }
-    return state_;
-  }
-
-  error_message = "Unsupported command.";
+  error_message = "Unsupported command: " + cmd;
+  std::scoped_lock lock(mutex_);
   return state_;
 }
 
-bool EdgeDaemon::Healthy() const { return running_.load(); }
+void EdgeDaemon::ScanWorker() {
+  while (true) {
+    int index = 0;
+    int width = 0;
+    int height = 0;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      scan_cv_.wait(lock, [&] {
+        return scan_state_ == ScanState::Scanning || scan_state_ == ScanState::Stopping;
+      });
+      if (scan_state_ == ScanState::Stopping) return;
 
-void EdgeDaemon::RunLoop() {
-  while (running_) {
-    Tick();
-    std::this_thread::sleep_for(std::chrono::milliseconds(config_.tick_interval_ms));
+      width  = state_.grid.empty() ? 0 : static_cast<int>(state_.grid.front().size());
+      height = static_cast<int>(state_.grid.size());
+      if (width == 0 || height == 0) {
+        scan_state_ = ScanState::Idle;
+        state_.mode = "idle";
+        return;
+      }
+      index = scan_index_;
+      if (index >= width * height) {
+        FinishScanLocked("Scan complete. Surface model updated.");
+        scan_state_ = ScanState::Idle;
+        return;
+      }
+    }
+
+    const auto [x, y] = CoordForIndex(index, width);
+    const double tgt_yaw   = TargetYawForCell(x, width);
+    const double tgt_pitch = TargetPitchForCell(y, height);
+
+    const auto move = motion_->MoveTo(tgt_yaw, tgt_pitch);
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ == ScanState::Stopping) return;
+      if (!move.success) {
+        FailLocked("Scan move failed: " + move.error);
+        safety_->TriggerFault(FaultCode::MotionAbort, move.error);
+        scan_state_ = ScanState::Idle;
+        return;
+      }
+      if (scan_state_ == ScanState::Paused) continue;  // don't capture; re-park on CV
+    }
+
+    gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
+    const double distance = lidar_->ReadDistanceMeters(tgt_yaw, tgt_pitch);
+
+    std::scoped_lock lock(mutex_);
+    if (scan_state_ == ScanState::Stopping) return;
+
+    if (std::isnan(distance)) {
+      FailLocked("Lidar read failed: " + lidar_->last_error());
+      safety_->TriggerFault(FaultCode::LidarFault, lidar_->last_error());
+      scan_state_ = ScanState::Idle;
+      return;
+    }
+
+    // Normalise to a 0..1 "surface confidence" band for the web UI heatmap.
+    const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
+    state_.grid[y][x] = Round(normalised, 10000.0);
+    filled_cells_ = std::max(filled_cells_, index + 1);
+    scan_index_ = index + 1;
+
+    const int total = width * height;
+    state_.coverage = Round(static_cast<double>(filled_cells_) / std::max(1, total), 10000.0);
+    state_.scan_progress = state_.coverage;
+    UpdateMetricsLocked();
+
+    if (scan_index_ >= total) {
+      FinishScanLocked("Scan complete. Surface model updated.");
+      scan_state_ = ScanState::Idle;
+      return;
+    }
   }
 }
 
-void EdgeDaemon::Tick() {
-  std::scoped_lock lock(mutex_);
-  const auto now = std::chrono::steady_clock::now();
-  const bool using_simulation = config_.simulate_hardware || !config_.enable_serial;
+std::pair<int, int> EdgeDaemon::CoordForIndex(int index, int width) const {
+  int row = width > 0 ? index / width : 0;
+  int col = width > 0 ? index % width : 0;
+  if (row % 2 == 1) col = (width - 1) - col;  // boustrophedon: halves the seek distance
+  return {col, row};
+}
 
-  if (!using_simulation && serial_->IsOpen() &&
-      now - last_status_poll_at_ >= std::chrono::milliseconds(config_.status_poll_interval_ms)) {
-    last_status_poll_at_ = now;
-    if (!RefreshHardwareStateLocked() && state_.mode == "scanning") {
-      FailHardwareLocked("Failed to refresh Arduino status.");
-    }
+double EdgeDaemon::TargetYawForCell(int x, int width) const {
+  const double range = state_.scan_settings.yaw_max - state_.scan_settings.yaw_min;
+  const double denom = std::max(1, width - 1);
+  return state_.scan_settings.yaw_min + (static_cast<double>(x) / denom) * range;
+}
+
+double EdgeDaemon::TargetPitchForCell(int y, int height) const {
+  const double range = state_.scan_settings.pitch_max - state_.scan_settings.pitch_min;
+  const double denom = std::max(1, height - 1);
+  return state_.scan_settings.pitch_min + (static_cast<double>(y) / denom) * range;
+}
+
+void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
+  int width  = config_.service.grid_width;
+  int height = config_.service.grid_height;
+  if (resolution == "low") {
+    width = 24; height = 12;
+  } else if (resolution == "high") {
+    width  = std::max(72, config_.service.grid_width  + config_.service.grid_width  / 2);
+    height = std::max(36, config_.service.grid_height + config_.service.grid_height / 2);
   }
 
-  if (!using_simulation && serial_->IsOpen() &&
-      (state_.mode == "manual" || state_.mode == "scanning" || state_.mode == "paused") &&
-      now - last_heartbeat_at_ >= std::chrono::milliseconds(config_.heartbeat_interval_ms)) {
-    last_heartbeat_at_ = now;
-    std::string response;
-    if (!SendArduinoCommandLocked("HEARTBEAT", response, false) && state_.mode == "scanning") {
-      FailHardwareLocked("Failed to maintain Arduino heartbeat: " + response);
-    }
-  }
-
-  if (state_.mode == "scanning" && state_.faults.empty()) {
-    const int total_cells = static_cast<int>(state_.grid.size() * (state_.grid.empty() ? 0 : state_.grid.front().size()));
-    if (current_scan_index_ >= total_cells) {
-      FinishScanLocked("Scan complete. Surface model updated.");
-    } else if (!scan_waiting_for_settle_) {
-      std::string error_message;
-      if (!IssueMoveToCellLocked(current_scan_index_, error_message)) {
-        FailHardwareLocked(error_message);
-      } else {
-        scan_waiting_for_settle_ = true;
-        last_move_issued_at_ = now;
-      }
-    } else {
-      const bool settled = (using_simulation || !hardware_moving_) &&
-                           now - last_move_issued_at_ >= std::chrono::milliseconds(config_.move_settle_ms);
-      if (settled) {
-        std::string error_message;
-        if (!CaptureCurrentCellLocked(current_scan_index_, error_message)) {
-          FailHardwareLocked(error_message);
-        } else {
-          ++current_scan_index_;
-          scan_waiting_for_settle_ = false;
-          if (current_scan_index_ >= total_cells) {
-            FinishScanLocked("Scan complete. Surface model updated.");
-          }
-        }
-      }
-    }
-  }
-
-  UpdateMetricsLocked();
+  state_.scan_settings.resolution = resolution.empty() ? std::string("medium") : resolution;
+  state_.grid.assign(height, std::vector<double>(width, -1.0));
+  const double per_point_ms = 80.0;  // rough budget: move + settle + trigger + read
+  state_.scan_duration_seconds =
+      Round((static_cast<double>(width) * height * per_point_ms) / 1000.0, 100.0);
+  ResetScanLocked();
 }
 
 void EdgeDaemon::ResetScanLocked() {
-  for (auto& row : state_.grid) {
-    std::fill(row.begin(), row.end(), -1.0);
-  }
+  for (auto& row : state_.grid) std::fill(row.begin(), row.end(), -1.0);
   state_.coverage = 0.0;
   state_.scan_progress = 0.0;
   state_.last_completed_scan_at.reset();
   filled_cells_ = 0;
-  current_scan_index_ = 0;
-  scan_waiting_for_settle_ = false;
-  hardware_moving_ = false;
+  scan_index_ = 0;
 }
 
-void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
-  int width = config_.grid_width;
-  int height = config_.grid_height;
-  if (resolution == "low") {
-    width = 24;
-    height = 12;
-  } else if (resolution == "high") {
-    width = std::max(72, config_.grid_width + (config_.grid_width / 2));
-    height = std::max(36, config_.grid_height + (config_.grid_height / 2));
-  }
-
-  state_.scan_settings.resolution = resolution.empty() ? "medium" : resolution;
-  state_.grid.assign(height, std::vector<double>(width, -1.0));
-  state_.scan_duration_seconds = Round((static_cast<double>(width * height) * config_.estimated_point_time_ms) / 1000.0, 100.0);
-  ResetScanLocked();
+void EdgeDaemon::AddLogLocked(const std::string& source, const std::string& level,
+                              const std::string& message) {
+  state_.activity.insert(state_.activity.begin(),
+                         ActivityEntry{source, CurrentTimestamp(), message, level});
+  if (state_.activity.size() > 20) state_.activity.resize(20);
 }
 
 void EdgeDaemon::UpdateMetricsLocked() {
-  const bool active_scan = state_.mode == "scanning";
-  const bool active_motion = hardware_moving_ || scan_waiting_for_settle_ || state_.mode == "manual";
-
-  state_.metrics.motor_temp_c = Round(31.0 + (active_scan ? 4.0 : 0.8) + (active_motion ? 1.2 : 0.0), 10.0);
-  state_.metrics.motor_current_a = Round(active_motion ? 1.45 : 0.42, 100.0);
-  state_.metrics.lidar_fps = active_scan ? std::max(1, 1000 / std::max(1, config_.estimated_point_time_ms)) : 0;
-  state_.metrics.radar_fps = 0;
-  state_.metrics.latency_ms = active_scan ? config_.estimated_point_time_ms : 30;
-}
-
-void EdgeDaemon::AddLogLocked(const std::string& source, const std::string& level, const std::string& message) {
-  state_.activity.insert(state_.activity.begin(), ActivityEntry{source, CurrentTimestamp(), message, level});
-  if (state_.activity.size() > 20) {
-    state_.activity.resize(20);
-  }
-}
-
-bool EdgeDaemon::RefreshHardwareStateLocked() {
-  if (config_.simulate_hardware || !config_.enable_serial) {
-    state_.connected = true;
-    return true;
-  }
-
-  std::string response;
-  if (!SendArduinoCommandLocked("STATUS", response, false)) {
-    state_.connected = false;
-    return false;
-  }
-
-  return ParseStatusLineLocked(response);
-}
-
-bool EdgeDaemon::ParseStatusLineLocked(const std::string& line) {
-  if (!StartsWith(line, "STATUS ")) {
-    FailHardwareLocked("Unexpected Arduino status line: " + line);
-    return false;
-  }
-
-  std::istringstream stream(line.substr(7));
-  std::string token;
-  std::string mode = state_.mode;
-  bool moving = hardware_moving_;
-  double yaw = state_.yaw;
-  double pitch = state_.pitch;
-  int fault = 0;
-
-  try {
-    while (stream >> token) {
-      const auto separator = token.find('=');
-      if (separator == std::string::npos) {
-        continue;
-      }
-      const std::string key = token.substr(0, separator);
-      const std::string value = token.substr(separator + 1);
-      if (key == "mode") {
-        mode = value;
-      } else if (key == "moving") {
-        moving = value == "1" || value == "true";
-      } else if (key == "yaw") {
-        yaw = std::stod(value);
-      } else if (key == "pitch") {
-        pitch = std::stod(value);
-      } else if (key == "fault") {
-        fault = std::stoi(value);
-      }
-    }
-  } catch (...) {
-    FailHardwareLocked("Malformed Arduino status line: " + line);
-    return false;
-  }
-
-  state_.connected = true;
-  state_.mode = mode;
-  state_.yaw = Round(yaw, 100.0);
-  state_.pitch = Round(pitch, 100.0);
-  hardware_moving_ = moving;
-
-  if (fault != 0) {
-    state_.faults = {"Arduino fault mask " + std::to_string(fault)};
-  } else if (state_.faults.size() == 1 && StartsWith(state_.faults.front(), "Arduino fault mask ")) {
-    state_.faults.clear();
-  }
-
-  return true;
-}
-
-bool EdgeDaemon::SendArduinoCommandLocked(const std::string& line, std::string& response, bool allowSimulation) {
-  response.clear();
-
-  if ((config_.simulate_hardware || !config_.enable_serial) && allowSimulation) {
-    response = "OK simulated";
-    state_.connected = true;
-    return true;
-  }
-
-  if (!serial_->IsOpen()) {
-    response = "Arduino serial port is not connected.";
-    state_.connected = false;
-    return false;
-  }
-
-  if (!serial_->SendCommand(line, response, config_.command_timeout_ms)) {
-    response = serial_->last_error();
-    state_.connected = false;
-    return false;
-  }
-
-  state_.connected = true;
-  if (StartsWith(response, "ERR ")) {
-    response = response.substr(4);
-    return false;
-  }
-
-  return StartsWith(response, "OK ") || StartsWith(response, "STATUS ");
-}
-
-bool EdgeDaemon::IssueMoveToCellLocked(int index, std::string& error_message) {
-  error_message.clear();
-  const int width = state_.grid.empty() ? 0 : static_cast<int>(state_.grid.front().size());
-  const int height = static_cast<int>(state_.grid.size());
-  if (width <= 0 || height <= 0) {
-    error_message = "Scan grid is not configured.";
-    return false;
-  }
-
-  const auto [x, y] = CoordForIndex(index, width);
-  const double yaw_range = state_.scan_settings.yaw_max - state_.scan_settings.yaw_min;
-  const double pitch_range = state_.scan_settings.pitch_max - state_.scan_settings.pitch_min;
-  pending_target_yaw_ = state_.scan_settings.yaw_min + (static_cast<double>(x) / std::max(1, width - 1)) * yaw_range;
-  pending_target_pitch_ = state_.scan_settings.pitch_min + (static_cast<double>(y) / std::max(1, height - 1)) * pitch_range;
-
-  if (config_.simulate_hardware || !config_.enable_serial) {
-    state_.yaw = Round(pending_target_yaw_, 100.0);
-    state_.pitch = Round(pending_target_pitch_, 100.0);
-    hardware_moving_ = false;
-    return true;
-  }
-
-  std::string response;
-  const std::string command = "MOVE " + FormatCommandFloat(pending_target_yaw_) + " " + FormatCommandFloat(pending_target_pitch_);
-  if (!SendArduinoCommandLocked(command, response)) {
-    error_message = response;
-    return false;
-  }
-
-  hardware_moving_ = true;
-  return true;
-}
-
-bool EdgeDaemon::CaptureCurrentCellLocked(int index, std::string& error_message) {
-  error_message.clear();
-
-  std::string response;
-  if (!SendArduinoCommandLocked("TRIGGER", response)) {
-    error_message = response;
-    return false;
-  }
-
-  const double distance = lidar_->ReadDistanceMeters(pending_target_yaw_, pending_target_pitch_);
-  if (std::isnan(distance)) {
-    error_message = "Lidar read failed: " + lidar_->last_error();
-    return false;
-  }
-
-  const int width = state_.grid.empty() ? 0 : static_cast<int>(state_.grid.front().size());
-  const auto [x, y] = CoordForIndex(index, width);
-  const double normalized = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
-  state_.grid[y][x] = Round(normalized, 10000.0);
-  state_.yaw = Round(pending_target_yaw_, 100.0);
-  state_.pitch = Round(pending_target_pitch_, 100.0);
-  filled_cells_ = std::max(filled_cells_, index + 1);
-
-  const int total_cells = static_cast<int>(state_.grid.size() * width);
-  state_.coverage = Round(static_cast<double>(filled_cells_) / std::max(1, total_cells), 10000.0);
-  state_.scan_progress = state_.coverage;
-  hardware_moving_ = false;
-  return true;
-}
-
-void EdgeDaemon::FailHardwareLocked(const std::string& message) {
-  state_.connected = false;
-  state_.mode = "fault";
-  state_.faults = {message};
-  hardware_moving_ = false;
-  scan_waiting_for_settle_ = false;
-  AddLogLocked("hardware", "error", message);
+  const bool scanning = state_.mode == "scanning";
+  const bool moving   = motion_->is_busy();
+  state_.metrics.motor_temp_c   = Round(31.0 + (scanning ? 4.0 : 0.8) + (moving ? 1.2 : 0.0), 10.0);
+  state_.metrics.motor_current_a = Round(moving ? 1.45 : 0.42, 100.0);
+  state_.metrics.lidar_fps      = scanning ? 12 : 0;
+  state_.metrics.radar_fps      = 0;
+  state_.metrics.latency_ms     = scanning ? 80 : 30;
 }
 
 void EdgeDaemon::FinishScanLocked(const std::string& message) {
@@ -560,26 +517,14 @@ void EdgeDaemon::FinishScanLocked(const std::string& message) {
   state_.coverage = 1.0;
   state_.scan_progress = 1.0;
   state_.last_completed_scan_at = CurrentTimestamp();
-  hardware_moving_ = false;
-  scan_waiting_for_settle_ = false;
   AddLogLocked("scanner", "info", message);
 }
 
-std::pair<int, int> EdgeDaemon::CoordForIndex(int index, int width) {
-  const int row = width > 0 ? index / width : 0;
-  int col = width > 0 ? index % width : 0;
-  if (row % 2 == 1) {
-    col = (width - 1) - col;
-  }
-  return {col, row};
-}
-
-double EdgeDaemon::Clamp(double value, double min_value, double max_value) {
-  return std::max(min_value, std::min(value, max_value));
-}
-
-double EdgeDaemon::Round(double value, double scale) {
-  return std::round(value * scale) / scale;
+void EdgeDaemon::FailLocked(const std::string& message) {
+  state_.connected = false;
+  state_.mode = "fault";
+  state_.faults = {message};
+  AddLogLocked("hardware", "error", message);
 }
 
 }  // namespace edge

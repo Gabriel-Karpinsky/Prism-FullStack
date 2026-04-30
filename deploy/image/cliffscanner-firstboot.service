@@ -1,0 +1,14 @@
+[Unit]
+Description=Cliff Scanner first-boot provisioning (hostname, Tailscale)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=!/var/lib/cliffscanner/firstboot-done
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/cliffscanner-firstboot
+ExecStartPost=/usr/bin/touch /var/lib/cliffscanner/firstboot-done
+RemainAfterExit=no
+
+[Install]
+WantedBy=multi-user.target
