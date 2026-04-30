@@ -37,32 +37,50 @@ permissions:
   packages: write   # docker push to GHCR
 
 env:
-  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/cliffscanner-control-api
   # Pin a known-good Pi OS Lite 64-bit. Bump this every ~6 months — the URL
   # 404s when Raspberry Pi rotates the release. See "Risks" in the plan doc.
   RPIOS_URL: https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64-lite.img.xz
+  # Opt every JS action into the Node 24 runtime ahead of GitHub forcing it
+  # in June 2026. Silences the deprecation warnings that the v3/v4/v6 action
+  # pins still emit on Node 20.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build-control-api:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.value }}
-      image_ref: ${{ steps.version.outputs.image_ref }}
+      version:    ${{ steps.version.outputs.value }}
+      image_ref:  ${{ steps.version.outputs.image_ref }}
+      ghcr_image: ${{ steps.version.outputs.ghcr_image }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version
+      - name: Resolve version + lowercase image ref
         id: version
+        # GHCR rejects mixed-case repository components, but ${{ github.repository_owner }}
+        # preserves the original casing (e.g. "Gabriel-Karpinsky"). Lowercase it once
+        # here and emit every derived name as a step output so later steps don't have
+        # to re-do the dance.
+        env:
+          OWNER: ${{ github.repository_owner }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            v="${{ inputs.version }}"
+          owner_lc="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          ghcr_image="ghcr.io/${owner_lc}/cliffscanner-control-api"
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            v="${INPUT_VERSION}"
           elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             v="${GITHUB_REF_NAME}"
           else
             v="dev-$(echo "${GITHUB_SHA}" | cut -c1-7)"
           fi
-          echo "value=${v}"                          >> "$GITHUB_OUTPUT"
-          echo "image_ref=${GHCR_IMAGE}:${v}"        >> "$GITHUB_OUTPUT"
+
+          {
+            echo "value=${v}"
+            echo "ghcr_image=${ghcr_image}"
+            echo "image_ref=${ghcr_image}:${v}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -90,10 +108,10 @@ jobs:
             VERSION=${{ steps.version.outputs.value }}
           tags: |
             ${{ steps.version.outputs.image_ref }}
-            ${{ env.GHCR_IMAGE }}:latest
+            ${{ steps.version.outputs.ghcr_image }}:latest
           # Layer cache lives in the same registry — no external cache infra.
-          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
+          cache-from: type=registry,ref=${{ steps.version.outputs.ghcr_image }}:buildcache
+          cache-to:   type=registry,ref=${{ steps.version.outputs.ghcr_image }}:buildcache,mode=max
 
   build-pi-image:
     needs: build-control-api
