@@ -170,6 +170,28 @@ jobs:
           cp -a apps deploy docs workspace/scripts/files/repo/
           find workspace/scripts/files/repo -maxdepth 1 -mindepth 1 -type d -print
 
+      - name: Log in to GHCR (for image save)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bake control-api image into rootfs as docker-save tarball
+        # Running dockerd inside the qemu-aarch64 CustoPiZer chroot is fragile
+        # (cgroup + binfmt mismatches), so we do the pull on the host runner
+        # — where Docker happily pulls arm64 manifests via the registry — and
+        # ship the resulting `docker save` tarball inside the image. A oneshot
+        # systemd unit on the Pi runs `docker load` against this file before
+        # the control-api compose service starts, so first boot needs zero
+        # network for the container path.
+        run: |
+          docker pull --platform linux/arm64 "${CONTROL_API_IMAGE}"
+          mkdir -p workspace/scripts/files
+          docker save "${CONTROL_API_IMAGE}" \
+              -o workspace/scripts/files/control-api.tar
+          ls -lh workspace/scripts/files/control-api.tar
+
       - name: Run CustoPiZer (qemu-aarch64 chroot bake)
         # EDITBASE_ARCH defaults to armv7l, which would make qemu pick the
         # 32-bit interpreter and chroot would refuse our arm64 base. Override

@@ -91,48 +91,39 @@ make -C /opt/cliffscanner/apps/edge-daemon clean
 rm -rf /opt/cliffscanner/apps/edge-daemon/src/*.o
 
 # ---------------------------------------------------------------------------
-# 5. Pre-pull the control-api container into the local Docker cache.
+# 5. Bake the control-api container into the rootfs as a docker-save tarball.
 #
-# Running dockerd inside the chroot is finicky — the host's binfmt + the
-# image's cgroup expectations don't always agree. We try, and if it fails we
-# fall back to letting first-boot pull the image (still no manual setup,
-# just one network round-trip on first power-on). The fallback is logged and
-# the image still ships; the bake doesn't fail on this alone.
+# The workflow already did `docker pull --platform linux/arm64` on the GitHub
+# runner (where Docker actually works) and ran `docker save` to produce
+# /files/control-api.tar. We just copy it into the image; a oneshot systemd
+# unit (cliffscanner-load-image.service, installed below) runs `docker load`
+# against this file once on first start, before the compose service comes up.
+# This means the device needs zero network for the control-api container path
+# on first boot — which matches the Tailscale-on-first-boot guarantee for the
+# rest of the appliance.
 # ---------------------------------------------------------------------------
-PRELOAD_OK=1
-if service docker start; then
-    if docker pull "${CONTROL_API_IMAGE}"; then
-        docker tag "${CONTROL_API_IMAGE}" cliffscanner-control-api:baked
-    else
-        PRELOAD_OK=0
-    fi
-    service docker stop || true
+install -d /var/lib/cliffscanner /etc/cliffscanner
+if [ -f /files/control-api.tar ]; then
+    install -m 0644 /files/control-api.tar /var/lib/cliffscanner/control-api.tar
+    echo "baked-tarball" > /etc/cliffscanner/control-api-source
 else
-    PRELOAD_OK=0
+    # Workflow forgot to stage the tarball — refuse to ship a half-broken image.
+    echo "FATAL: /files/control-api.tar missing; CI workflow is misconfigured" >&2
+    exit 1
 fi
 
-# Stage the docker-compose.yml. If we successfully baked the image, rewrite
-# it to use that local tag; otherwise leave the GHCR ref so first-boot pulls.
+# Stage docker-compose.yml and rewrite the build: stanza to reference the
+# loaded image by its full GHCR tag. After `docker load` the image is in the
+# local store under exactly that name, so compose finds it without a network
+# round-trip.
 install -d /opt/cliffscanner/deploy/pi
-install -d /etc/cliffscanner
-cp "${SOURCE_ROOT}/deploy/pi/docker-compose.yml" /opt/cliffscanner/deploy/pi/docker-compose.yml
-
-if [ "$PRELOAD_OK" = "1" ]; then
-    # Replace the build: stanza with image: cliffscanner-control-api:baked
-    sed -i \
-        -e 's|^\s*build:.*|    image: cliffscanner-control-api:baked|' \
-        -e '/^\s*context:/d' \
-        -e '/^\s*dockerfile:/d' \
-        /opt/cliffscanner/deploy/pi/docker-compose.yml
-    echo "preloaded" > /etc/cliffscanner/control-api-source
-else
-    sed -i \
-        -e "s|^\s*build:.*|    image: ${CONTROL_API_IMAGE}|" \
-        -e '/^\s*context:/d' \
-        -e '/^\s*dockerfile:/d' \
-        /opt/cliffscanner/deploy/pi/docker-compose.yml
-    echo "ghcr-pull-on-first-boot" > /etc/cliffscanner/control-api-source
-fi
+cp "${SOURCE_ROOT}/deploy/pi/docker-compose.yml" \
+   /opt/cliffscanner/deploy/pi/docker-compose.yml
+sed -i \
+    -e "s|^\s*build:.*|    image: ${CONTROL_API_IMAGE}|" \
+    -e '/^\s*context:/d' \
+    -e '/^\s*dockerfile:/d' \
+    /opt/cliffscanner/deploy/pi/docker-compose.yml
 
 # ---------------------------------------------------------------------------
 # 6. Config seeds.
@@ -152,10 +143,13 @@ install -m 0644 "${SOURCE_ROOT}/deploy/pi/cliffscanner-control-api.service" \
                 /etc/systemd/system/cliffscanner-control-api.service
 install -m 0644 "${SOURCE_ROOT}/deploy/image/cliffscanner-firstboot.service" \
                 /etc/systemd/system/cliffscanner-firstboot.service
+install -m 0644 "${SOURCE_ROOT}/deploy/image/cliffscanner-load-image.service" \
+                /etc/systemd/system/cliffscanner-load-image.service
 
 systemctl enable cliffscanner-edge.service
 systemctl enable cliffscanner-control-api.service
 systemctl enable cliffscanner-firstboot.service
+systemctl enable cliffscanner-load-image.service
 
 # ---------------------------------------------------------------------------
 # 8. Tailscale (binary only — auth happens at first boot if a key is dropped).
