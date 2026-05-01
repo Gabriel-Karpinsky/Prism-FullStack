@@ -37,9 +37,6 @@ permissions:
   packages: write   # docker push to GHCR
 
 env:
-  # Pin a known-good Pi OS Lite 64-bit. Bump this every ~6 months — the URL
-  # 404s when Raspberry Pi rotates the release. See "Risks" in the plan doc.
-  RPIOS_URL: https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64-lite.img.xz
   # Opt every JS action into the Node 24 runtime ahead of GitHub forcing it
   # in June 2026. Silences the deprecation warnings that the v3/v4/v6 action
   # pins still emit on Node 20.
@@ -116,9 +113,31 @@ jobs:
   build-pi-image:
     needs: build-control-api
     runs-on: ubuntu-latest
+    # Build both Lite (headless, the production target) and Desktop (full
+    # Raspberry Pi OS with LXDE — handy for on-device debugging via HDMI
+    # without needing a separate dev card). Both variants are produced on
+    # every workflow run; failures in one don't cancel the other so we
+    # always get at least one artifact.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: lite
+            url: https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64-lite.img.xz
+            # Lite ships ~1.5 GiB free; needs the full 2 GiB grow for our apt
+            # + edge-daemon build + control-api docker-save tarball (~150 MiB).
+            enlarge_mib: 2048
+          - variant: desktop
+            url: https://downloads.raspberrypi.com/raspios_arm64/images/raspios_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64.img.xz
+            # Desktop already has more headroom; 1 GiB is enough for our
+            # additions and avoids ballooning the final .img.xz further.
+            enlarge_mib: 1024
     env:
       VERSION: ${{ needs.build-control-api.outputs.version }}
       CONTROL_API_IMAGE: ${{ needs.build-control-api.outputs.image_ref }}
+      VARIANT: ${{ matrix.variant }}
+      RPIOS_URL: ${{ matrix.url }}
+      ENLARGE_MIB: ${{ matrix.enlarge_mib }}
     steps:
       - uses: actions/checkout@v4
 
@@ -134,10 +153,12 @@ jobs:
         id: cache-rpios
         uses: actions/cache@v4
         with:
+          # One cache slot per variant; key includes the URL so a URL bump
+          # in the matrix invalidates automatically.
           path: workspace/raspios.img.xz
-          key: rpios-${{ hashFiles('.github/workflows/build-image.yml') }}
+          key: rpios-${{ matrix.variant }}-${{ hashFiles('.github/workflows/build-image.yml') }}
 
-      - name: Download Raspberry Pi OS Lite 64-bit
+      - name: Download Raspberry Pi OS ${{ matrix.variant }} 64-bit
         if: steps.cache-rpios.outputs.cache-hit != 'true'
         run: |
           mkdir -p workspace
@@ -203,31 +224,34 @@ jobs:
           docker run --rm --privileged \
               -v "${PWD}/workspace:/CustoPiZer/workspace" \
               -e EDITBASE_ARCH=aarch64 \
-              -e EDITBASE_IMAGE_ENLARGEROOT=2048 \
+              -e EDITBASE_IMAGE_ENLARGEROOT="${ENLARGE_MIB}" \
               -e CONTROL_API_IMAGE="${CONTROL_API_IMAGE}" \
               -e CLIFFSCANNER_VERSION="${VERSION}" \
+              -e CLIFFSCANNER_VARIANT="${VARIANT}" \
               ghcr.io/octoprint/custopizer:latest
 
       - name: Rename + compress final image
         run: |
           sudo chown "$(id -u):$(id -g)" workspace/output.img
-          mv workspace/output.img "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
-          xz -T0 -9 -e "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
+          out="cliffscanner-pi-aarch64-${VARIANT}-${VERSION}.img"
+          mv workspace/output.img "workspace/${out}"
+          xz -T0 -9 -e "workspace/${out}"
           ls -lh workspace/
 
       - name: Compute checksums
         run: |
           cd workspace
-          sha256sum "cliffscanner-pi-aarch64-${VERSION}.img.xz" \
-              > "cliffscanner-pi-aarch64-${VERSION}.img.xz.sha256"
+          sha256sum "cliffscanner-pi-aarch64-${VARIANT}-${VERSION}.img.xz" \
+              > "cliffscanner-pi-aarch64-${VARIANT}-${VERSION}.img.xz.sha256"
 
       - name: Upload artifact (workflow_dispatch + tag both)
         uses: actions/upload-artifact@v4
         with:
-          name: cliffscanner-pi-aarch64-${{ env.VERSION }}
+          # Per-variant artifact name so both lite + desktop can coexist.
+          name: cliffscanner-pi-aarch64-${{ matrix.variant }}-${{ env.VERSION }}
           path: |
-            workspace/cliffscanner-pi-aarch64-*.img.xz
-            workspace/cliffscanner-pi-aarch64-*.img.xz.sha256
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -235,8 +259,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          # Both matrix legs upload to the same Release; softprops appends.
           files: |
-            workspace/cliffscanner-pi-aarch64-*.img.xz
-            workspace/cliffscanner-pi-aarch64-*.img.xz.sha256
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true

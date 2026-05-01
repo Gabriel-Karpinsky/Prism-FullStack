@@ -6,9 +6,13 @@ reads a Garmin LIDAR-Lite v3HP over I²C, and serves the operator UI.
 
 ## Quickstart (flash + power on)
 
-1. Download the latest pre-baked image:
-   <https://github.com/Gabriel-Karpinsky/Prism-FullStack/releases/latest>
-   (file: `cliffscanner-pi-aarch64-vX.Y.Z.img.xz`).
+1. Download the latest pre-baked image from
+   <https://github.com/Gabriel-Karpinsky/Prism-FullStack/releases/latest>:
+   - `cliffscanner-pi-aarch64-lite-vX.Y.Z.img.xz` — production target,
+     headless Raspberry Pi OS Lite. Use this on real scanners.
+   - `cliffscanner-pi-aarch64-desktop-vX.Y.Z.img.xz` — same provisioning
+     baked onto the full Raspberry Pi OS Desktop. Handy for bench testing
+     over HDMI without a separate dev SD card.
 2. Flash with **Raspberry Pi Imager** → "Use custom image". Set SSH/WiFi via
    Imager's customisation pane (Ctrl-Shift-X).
 3. (Optional) Drop a Tailscale auth key at `/boot/firmware/tailscale-authkey`
