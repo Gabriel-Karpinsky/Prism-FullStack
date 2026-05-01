@@ -8,12 +8,7 @@
 #include <thread>
 
 #include "motion_controller.hpp"
-
-#ifdef __linux__
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-#endif
+#include "systemd_notify.hpp"
 
 namespace edge {
 
@@ -108,28 +103,7 @@ void SafetySupervisor::RunLoop() {
 }
 
 void SafetySupervisor::NotifySystemdWatchdog() const {
-#ifdef __linux__
-  const char* socket_path = std::getenv("NOTIFY_SOCKET");
-  if (socket_path == nullptr || *socket_path == '\0') return;
-
-  const int fd = ::socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
-  if (fd < 0) return;
-
-  sockaddr_un addr{};
-  addr.sun_family = AF_UNIX;
-  if (socket_path[0] == '@') {
-    // Abstract socket namespace.
-    addr.sun_path[0] = '\0';
-    std::strncpy(addr.sun_path + 1, socket_path + 1, sizeof(addr.sun_path) - 2);
-  } else {
-    std::strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
-  }
-
-  const char* msg = "WATCHDOG=1";
-  ::sendto(fd, msg, std::strlen(msg), MSG_NOSIGNAL,
-           reinterpret_cast<const sockaddr*>(&addr), sizeof(addr));
-  ::close(fd);
-#endif
+  SystemdNotify("WATCHDOG=1");
 }
 
 }  // namespace edge

@@ -43,6 +43,9 @@ int main() {
               << config.service.bind_host << ':' << config.service.bind_port
               << " (config: " << config_path << ")" << std::endl;
 
+    // HttpServer::Run() sends READY=1 itself once the listening socket is
+    // bound — sending here would race ahead of bind+listen and let systemd
+    // activate dependents before the port is open.
     const int rc = server.Run();
     g_server = nullptr;
     daemon.Stop();

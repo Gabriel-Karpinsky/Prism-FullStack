@@ -25,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include "edge_daemon.hpp"
+#include "systemd_notify.hpp"
 
 #ifdef __linux__
 #include <arpa/inet.h>
@@ -170,6 +171,11 @@ int HttpServer::Run() {
     ::close(server_fd);
     return 1;
   }
+
+  // Listening socket is up — tell systemd we're done starting. Without
+  // this READY=1, a Type=notify unit hits TimeoutStartSec, gets killed,
+  // and dependents (control-api) fail with result 'dependency'.
+  edge::SystemdNotify("READY=1");
 
   while (!shutdown_.load()) {
     pollfd pfd{server_fd, POLLIN, 0};
