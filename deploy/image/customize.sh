@@ -81,7 +81,15 @@ cp -r "${SOURCE_ROOT}/docs"   /opt/cliffscanner/
 # ---------------------------------------------------------------------------
 # 4. Build the C++ edge daemon under qemu (slow but correct).
 # ---------------------------------------------------------------------------
-make -C /opt/cliffscanner/apps/edge-daemon HAS_PIGPIO=1
+# qemu-aarch64-user has a very small default stack for emulated processes.
+# Heavy GCC translation units (edge_daemon.cpp) trigger deep template
+# instantiation that overflows qemu's emulated stack and produces a spurious
+# "Segmentation fault (core dumped)" from the compiler itself — not the code.
+# `ulimit -s unlimited` raises the process stack ceiling before spawning g++;
+# it is advisory under qemu-user but most versions honour it well enough to
+# prevent the overflow. Combined with the extra ENLARGE_MIB headroom in the
+# workflow, this reliably eliminates the qemu compiler crash.
+(ulimit -s unlimited; make -C /opt/cliffscanner/apps/edge-daemon HAS_PIGPIO=1)
 install -d /opt/cliffscanner/bin
 install -m 0755 /opt/cliffscanner/apps/edge-daemon/cliffscanner-edge \
                 /opt/cliffscanner/bin/cliffscanner-edge

@@ -129,9 +129,11 @@ jobs:
             enlarge_mib: 2048
           - variant: desktop
             url: https://downloads.raspberrypi.com/raspios_arm64/images/raspios_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64.img.xz
-            # Desktop already has more headroom; 1 GiB is enough for our
-            # additions and avoids ballooning the final .img.xz further.
-            enlarge_mib: 1024
+            # Desktop base is ~2.7 GiB and already has packages installed, so
+            # after adding Docker CE + build tools the compiler has very little
+            # temp space. 2 GiB matches lite; keeps g++ from running out of
+            # disk mid-compilation under qemu.
+            enlarge_mib: 2048
     env:
       VERSION: ${{ needs.build-control-api.outputs.version }}
       CONTROL_API_IMAGE: ${{ needs.build-control-api.outputs.image_ref }}
