@@ -117,7 +117,7 @@ shipped defaults match the documented envelope:
     "yaw":   {"min_deg": -50, "max_deg": 50, "max_speed_deg_s": 18, "accel_deg_s2": 60},
     "pitch": {"min_deg": -30, "max_deg": 30, "max_speed_deg_s": 12, "accel_deg_s2": 40}
   },
-  "mechanics": {"full_steps_per_rev": 200, "microsteps": 128, "yaw_gear_ratio": 1.0, "pitch_gear_ratio": 1.0},
+  "mechanics": {"full_steps_per_rev": 200, "microsteps": 32, "yaw_gear_ratio": 1.0, "pitch_gear_ratio": 1.0},
   "gpio":     {"yaw_step": 17, "yaw_dir": 27, "pitch_step": 22, "pitch_dir": 23,
                 "enable": 24, "lidar_trigger": 25, "status_led": 18,
                 "step_active_low": true, "dir_active_low": false, "enable_active_low": true},

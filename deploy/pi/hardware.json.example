@@ -5,7 +5,7 @@
   },
   "mechanics": {
     "full_steps_per_rev": 200,
-    "microsteps": 128,
+    "microsteps": 32,
     "yaw_gear_ratio": 1.0,
     "pitch_gear_ratio": 1.0
   },
