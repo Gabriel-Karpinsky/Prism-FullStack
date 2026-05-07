@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <limits>
 #include <memory>
 #include <thread>
@@ -123,14 +124,46 @@ bool GarminLidarLiteV3HPSensor::ReadRegister16(std::uint8_t reg, std::uint16_t& 
 
 bool GarminLidarLiteV3HPSensor::WaitForReady() {
 #ifdef __linux__
-  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(120);
+  // The v3HP can take several hundred ms to complete a measurement when the
+  // target is dim, far, or out of range — the laser keeps integrating until
+  // it has signal. Garmin's reference Arduino library caps with a 10 000-
+  // iteration counter (≈500 ms at 100 kHz). 500 ms matches that intent.
+  //
+  // Status register layout (0x01):
+  //   bit 0 = system busy        ← we wait for this to clear
+  //   bit 1 = signal not valid   ← treat as "measurement complete but no return"
+  //   bit 2 = reference overflow
+  //   bit 3 = signal overflow
+  //   bit 4 = system failure     ← treat as hard fault
+  //   bit 6 = process done
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
+  std::uint8_t last_status = 0xFF;
   while (std::chrono::steady_clock::now() < deadline) {
     std::uint8_t status = 0;
     if (!ReadRegister(0x01, status)) return false;
-    if ((status & 0x01U) == 0U) return true;
+    last_status = status;
+
+    // 0xFF on every read = bus electrical issue (LIDAR not really driving SDA);
+    // bail out quickly so the operator sees a useful error instead of a 500 ms
+    // hang every cycle.
+    if (status == 0xFFU) {
+      last_error_ = "lidar status reads 0xFF — bus electrical issue (check decoupling cap, pull-ups, ground)";
+      return false;
+    }
+
+    if ((status & 0x10U) != 0U) {
+      last_error_ = "lidar reports system failure (status bit 4 set)";
+      return false;
+    }
+
+    if ((status & 0x01U) == 0U) return true;  // not busy → done
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
   }
-  last_error_ = "lidar measurement timed out";
+  char buf[64];
+  std::snprintf(buf, sizeof(buf),
+                "lidar measurement timed out (last status=0x%02X)",
+                last_status);
+  last_error_ = buf;
   return false;
 #else
   return false;
