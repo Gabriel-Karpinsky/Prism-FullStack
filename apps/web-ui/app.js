@@ -2,6 +2,8 @@ const state = {
   snapshot: null,
   lastMessage: "Loading scanner state...",
   pollHandle: null,
+  // Last motion config loaded from the server. Used by "Reset to loaded".
+  loadedMotionConfig: null,
 };
 
 const el = {
@@ -23,6 +25,18 @@ const el = {
   faultBanner: document.getElementById("fault-banner"),
   activityLog: document.getElementById("activity-log"),
   mapCanvas: document.getElementById("surface-map"),
+  // Motion config panel
+  mcYawMin:    document.getElementById("mc-yaw-min"),
+  mcYawMax:    document.getElementById("mc-yaw-max"),
+  mcYawSpeed:  document.getElementById("mc-yaw-speed"),
+  mcYawAccel:  document.getElementById("mc-yaw-accel"),
+  mcPitchMin:  document.getElementById("mc-pitch-min"),
+  mcPitchMax:  document.getElementById("mc-pitch-max"),
+  mcPitchSpeed: document.getElementById("mc-pitch-speed"),
+  mcPitchAccel: document.getElementById("mc-pitch-accel"),
+  motionApplyBtn: document.getElementById("motion-apply-btn"),
+  motionResetBtn: document.getElementById("motion-reset-btn"),
+  motionConfigStatus: document.getElementById("motion-config-status"),
 };
 
 const ctx = el.mapCanvas.getContext("2d");
@@ -236,6 +250,90 @@ async function sendCommand(command, payload = {}) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Motion config panel
+// ---------------------------------------------------------------------------
+
+function setMotionStatus(message, isError = false) {
+  el.motionConfigStatus.textContent = message;
+  el.motionConfigStatus.style.color = isError ? "#9e3328" : "";
+}
+
+function populateMotionFields(cfg) {
+  el.mcYawMin.value    = cfg.yaw.min_deg;
+  el.mcYawMax.value    = cfg.yaw.max_deg;
+  el.mcYawSpeed.value  = cfg.yaw.max_speed_deg_s;
+  el.mcYawAccel.value  = cfg.yaw.accel_deg_s2;
+  el.mcPitchMin.value  = cfg.pitch.min_deg;
+  el.mcPitchMax.value  = cfg.pitch.max_deg;
+  el.mcPitchSpeed.value = cfg.pitch.max_speed_deg_s;
+  el.mcPitchAccel.value = cfg.pitch.accel_deg_s2;
+}
+
+function readMotionFields() {
+  return {
+    yaw: {
+      min_deg:          parseFloat(el.mcYawMin.value),
+      max_deg:          parseFloat(el.mcYawMax.value),
+      max_speed_deg_s:  parseFloat(el.mcYawSpeed.value),
+      accel_deg_s2:     parseFloat(el.mcYawAccel.value),
+    },
+    pitch: {
+      min_deg:          parseFloat(el.mcPitchMin.value),
+      max_deg:          parseFloat(el.mcPitchMax.value),
+      max_speed_deg_s:  parseFloat(el.mcPitchSpeed.value),
+      accel_deg_s2:     parseFloat(el.mcPitchAccel.value),
+    },
+  };
+}
+
+async function loadMotionConfig() {
+  try {
+    const cfg = await request("/api/config/motion", { method: "GET" });
+    state.loadedMotionConfig = cfg;
+    populateMotionFields(cfg);
+    setMotionStatus("Limits loaded from device.");
+  } catch (error) {
+    setMotionStatus(`Failed to load motion config: ${error.message}`, true);
+  }
+}
+
+async function applyMotionConfig() {
+  const user = getUser();
+  if (!user) {
+    setMotionStatus("Enter a user name and acquire control before changing limits.", true);
+    return;
+  }
+  const motion = readMotionFields();
+  if (motion.yaw.min_deg >= motion.yaw.max_deg) {
+    setMotionStatus("Yaw: min must be less than max.", true); return;
+  }
+  if (motion.pitch.min_deg >= motion.pitch.max_deg) {
+    setMotionStatus("Pitch: min must be less than max.", true); return;
+  }
+  try {
+    const updated = await request("/api/config/motion", {
+      method: "PUT",
+      body: JSON.stringify({ user, motion }),
+    });
+    state.loadedMotionConfig = updated;
+    populateMotionFields(updated);
+    setMotionStatus("Motion limits applied and persisted to device.");
+  } catch (error) {
+    setMotionStatus(error.message, true);
+  }
+}
+
+el.motionApplyBtn.addEventListener("click", applyMotionConfig);
+el.motionResetBtn.addEventListener("click", () => {
+  if (state.loadedMotionConfig) {
+    populateMotionFields(state.loadedMotionConfig);
+    setMotionStatus("Reset to last loaded values.");
+  }
+});
+
+// ---------------------------------------------------------------------------
+
 el.acquireBtn.addEventListener("click", acquireControl);
 el.releaseBtn.addEventListener("click", releaseControl);
 
@@ -259,4 +357,5 @@ el.resolutionSelect.addEventListener("change", () => {
 });
 
 pollState();
+loadMotionConfig();
 state.pollHandle = window.setInterval(pollState, 700);

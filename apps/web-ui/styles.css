@@ -129,11 +129,65 @@ body {
 
 .panel-map {
     grid-column: 2;
-    grid-row: span 2;
+    grid-row: span 3;
 }
 
 .panel-telemetry {
     grid-column: 3;
+}
+
+.panel-motion-config {
+    grid-column: 3;
+}
+
+/* Motion config panel internals */
+.motion-axes {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-bottom: 14px;
+}
+
+.motion-axis {
+    border: 1px solid var(--panel-border);
+    border-radius: 12px;
+    padding: 10px 14px 12px;
+    margin: 0;
+}
+
+.motion-axis legend {
+    padding: 0 6px;
+    font-size: 0.82rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--primary-strong);
+}
+
+.field-inline {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 0.9rem;
+}
+
+.field-inline span {
+    color: var(--muted);
+    white-space: nowrap;
+    min-width: 80px;
+}
+
+.field-inline input[type="number"] {
+    width: 90px;
+    padding: 4px 8px;
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    font-size: 0.9rem;
+    color: var(--ink);
+    background: rgba(255,255,255,0.7);
+    text-align: right;
 }
 
 .field {
@@ -328,6 +382,7 @@ select {
     .panel-controls,
     .panel-map,
     .panel-telemetry,
+    .panel-motion-config,
     .panel-log {
         grid-column: auto;
         grid-row: auto;
