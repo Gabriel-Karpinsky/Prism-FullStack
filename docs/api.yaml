@@ -1,0 +1,636 @@
+openapi: "3.1.0"
+
+info:
+  title: Cliff Scanner API
+  version: "1.0"
+  description: |
+    Two HTTP services run on the Pi. Operators and the web UI talk to the
+    **Control API** (port 8080). The Control API talks to the **Edge Daemon**
+    (port 9090, localhost-only). External clients should never reach 9090
+    directly in production — use Tailscale Serve to expose 8080 only.
+
+    ### Single-operator lease
+
+    Most write operations require a *control lease*. A lease is acquired by
+    `POST /api/control/acquire` with a user name. Only one user holds the
+    lease at a time. Commands sent with a non-matching user are rejected 409.
+    The `connect` command is exempt so any observer can verify edge-daemon
+    connectivity.
+
+    ### Backend modes
+
+    Set `SCANNER_BACKEND=edge` (default when deployed on Pi) to proxy to the
+    real edge daemon. Set `SCANNER_BACKEND=sim` (default in development) to
+    use the in-process simulation service. The HTTP surface is identical in
+    both modes.
+
+servers:
+  - url: http://{host}:8080
+    description: Control API (operator-facing)
+    variables:
+      host:
+        default: "127.0.0.1"
+        description: Pi LAN IP, Tailscale IP, or localhost
+  - url: http://127.0.0.1:9090
+    description: Edge Daemon API (localhost only — do not expose externally)
+
+# ---------------------------------------------------------------------------
+# Reusable schemas
+# ---------------------------------------------------------------------------
+components:
+  schemas:
+
+    AxisMotion:
+      type: object
+      description: Motion envelope for one rotational axis.
+      required: [min_deg, max_deg, max_speed_deg_s, accel_deg_s2]
+      properties:
+        min_deg:
+          type: number
+          format: double
+          description: Negative travel limit in degrees (e.g. -50).
+          example: -50.0
+        max_deg:
+          type: number
+          format: double
+          description: Positive travel limit in degrees (e.g. 50).
+          example: 50.0
+        max_speed_deg_s:
+          type: number
+          format: double
+          description: Peak velocity cap in degrees per second.
+          example: 18.0
+        accel_deg_s2:
+          type: number
+          format: double
+          description: Trapezoidal profile acceleration in degrees per second².
+          example: 60.0
+
+    MotionConfig:
+      type: object
+      required: [yaw, pitch]
+      properties:
+        yaw:
+          $ref: "#/components/schemas/AxisMotion"
+        pitch:
+          $ref: "#/components/schemas/AxisMotion"
+
+    ScanSettings:
+      type: object
+      properties:
+        resolution:
+          type: string
+          enum: [low, medium, high]
+          description: Grid density preset.
+        yawMin:
+          type: number
+          format: double
+        yawMax:
+          type: number
+          format: double
+        pitchMin:
+          type: number
+          format: double
+        pitchMax:
+          type: number
+          format: double
+
+    Metrics:
+      type: object
+      properties:
+        motorTempC:
+          type: number
+          format: double
+          description: Estimated motor temperature (°C) — currently placeholder.
+        latencyMs:
+          type: integer
+          description: Round-trip latency between control-api and edge daemon (ms).
+
+    ActivityEntry:
+      type: object
+      properties:
+        ts:
+          type: string
+          format: date-time
+          description: ISO-8601 timestamp.
+        source:
+          type: string
+          description: Subsystem that logged the event (e.g. "motion", "safety").
+        level:
+          type: string
+          enum: [info, warn, error]
+        message:
+          type: string
+
+    Snapshot:
+      type: object
+      description: |
+        Complete scanner state returned by every API response. The web UI
+        renders all fields; poll `/api/state` at ~1 Hz to keep the UI live.
+      properties:
+        mode:
+          type: string
+          enum: [Idle, Scanning, Paused, Stopping, Faulted]
+        yaw:
+          type: number
+          format: double
+          description: Current yaw position (degrees).
+        pitch:
+          type: number
+          format: double
+          description: Current pitch position (degrees).
+        coverage:
+          type: number
+          format: double
+          description: Fraction of grid points measured so far [0, 1].
+        scanProgress:
+          type: number
+          format: double
+          description: Fraction of current scan completed [0, 1].
+        scanDurationSeconds:
+          type: number
+          format: double
+          description: Estimated total scan duration in seconds.
+        controlOwner:
+          type: string
+          nullable: true
+          description: User name holding the current control lease, or null.
+        faults:
+          type: array
+          items:
+            type: string
+          description: Active fault descriptions. Empty when healthy.
+        scanSettings:
+          $ref: "#/components/schemas/ScanSettings"
+        metrics:
+          $ref: "#/components/schemas/Metrics"
+        activity:
+          type: array
+          items:
+            $ref: "#/components/schemas/ActivityEntry"
+          description: Recent log entries, newest first.
+        grid:
+          type: array
+          items:
+            type: array
+            items:
+              type: number
+              format: double
+          description: |
+            2-D height-map grid. Each cell is a normalised value in [0, 1]
+            (or -1 if not yet measured). Row 0 is the lowest pitch row.
+
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: string
+          description: Human-readable error description.
+
+    CommandPayload:
+      type: object
+      description: |
+        Optional parameters for specific commands:
+        - `jog`: `{ axis: "yaw"|"pitch", delta: <degrees> }`
+        - `set_resolution`: `{ resolution: "low"|"medium"|"high" }`
+        All other commands ignore the payload.
+      additionalProperties: true
+
+# ---------------------------------------------------------------------------
+# Control API — port 8080
+# ---------------------------------------------------------------------------
+paths:
+
+  /healthz:
+    get:
+      tags: [control-api]
+      summary: Health check
+      description: Returns `{"ok":true}` when the control-api process is alive.
+        Does not verify edge-daemon connectivity.
+      operationId: controlapi.health
+      responses:
+        "200":
+          description: Service is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+
+  /api/state:
+    get:
+      tags: [control-api]
+      summary: Poll scanner state
+      description: |
+        Returns the latest cached Snapshot. The web UI calls this every 700 ms.
+        Does not require a control lease — any observer can poll.
+      operationId: controlapi.getState
+      responses:
+        "200":
+          description: Current scanner snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Snapshot"
+
+  /api/control/acquire:
+    post:
+      tags: [control-api]
+      summary: Acquire the operator control lease
+      description: |
+        Grants the calling user exclusive write access to scanner commands.
+        Only one user can hold the lease at a time. If another user already
+        holds it, returns 409.
+      operationId: controlapi.acquireLease
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user]
+              properties:
+                user:
+                  type: string
+                  maxLength: 24
+                  example: "survey-ops"
+      responses:
+        "200":
+          description: Lease granted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    $ref: "#/components/schemas/Snapshot"
+        "409":
+          description: Lease already held by another user.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/control/release:
+    post:
+      tags: [control-api]
+      summary: Release the operator control lease
+      description: |
+        Returns the lease to the "unclaimed" state. Only the current lease
+        holder can release. Other users receive 409.
+      operationId: controlapi.releaseLease
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user]
+              properties:
+                user:
+                  type: string
+                  example: "survey-ops"
+      responses:
+        "200":
+          description: Lease released.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    $ref: "#/components/schemas/Snapshot"
+        "409":
+          description: User is not the current lease holder.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/command:
+    post:
+      tags: [control-api]
+      summary: Send a scanner command
+      description: |
+        Dispatches a named command to the scanner. All commands except
+        `connect` require the calling user to hold the control lease.
+
+        **Available commands:**
+
+        | Command | Requires lease | Payload fields |
+        |---------|---------------|----------------|
+        | `connect` | No | — |
+        | `home` | Yes | — |
+        | `jog` | Yes | `axis` ("yaw"\|"pitch"), `delta` (degrees) |
+        | `set_resolution` | Yes | `resolution` ("low"\|"medium"\|"high") |
+        | `start_scan` | Yes | — |
+        | `pause_scan` | Yes | — |
+        | `resume_scan` | Yes | — |
+        | `stop_scan` | Yes | — |
+        | `estop` | Yes | — |
+        | `clear_fault` | Yes | — |
+      operationId: controlapi.command
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user, command]
+              properties:
+                user:
+                  type: string
+                  example: "survey-ops"
+                command:
+                  type: string
+                  example: "jog"
+                payload:
+                  $ref: "#/components/schemas/CommandPayload"
+      responses:
+        "200":
+          description: Command executed. State reflects the result.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  state:
+                    $ref: "#/components/schemas/Snapshot"
+        "409":
+          description: Lease violation or command rejected in current state.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/config/motion:
+    get:
+      tags: [control-api, config]
+      summary: Get motion envelope
+      description: |
+        Returns the current motion limits and dynamics for both axes. No
+        control lease required — any observer can read the config.
+        The control-api proxies this to the edge daemon's `/api/config/motion`.
+      operationId: controlapi.getMotionConfig
+      responses:
+        "200":
+          description: Current motion envelope.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MotionConfig"
+
+    put:
+      tags: [control-api, config]
+      summary: Update motion envelope
+      description: |
+        Applies new motion limits and dynamics. **Requires the control lease.**
+        Partial updates are supported — omit an axis or any field to keep its
+        current value. Validated against physical constraints before applying;
+        if the current gantry position lies outside the new envelope the
+        request is rejected.
+
+        Changes are persisted to `/etc/prism-scanner/hardware.json` on the Pi
+        and take effect immediately without a daemon restart. GPIO pin maps and
+        safety timings do require a restart.
+      operationId: controlapi.updateMotionConfig
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user]
+              properties:
+                user:
+                  type: string
+                  example: "survey-ops"
+                motion:
+                  $ref: "#/components/schemas/MotionConfig"
+      responses:
+        "200":
+          description: Config applied and persisted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MotionConfig"
+        "400":
+          description: Validation error (e.g. min_deg ≥ max_deg, current position outside new envelope).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Caller does not hold the control lease.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+# ---------------------------------------------------------------------------
+# Edge Daemon API — port 9090 (localhost only)
+# ---------------------------------------------------------------------------
+
+  /health:
+    get:
+      tags: [edge-daemon]
+      summary: Edge daemon health check
+      description: |
+        Returns `{"ok":true}` when the C++ edge daemon process is alive and
+        the HTTP server is accepting connections. Does not probe GPIO or LIDAR.
+        Called by the control-api on startup to verify connectivity.
+      operationId: edge.health
+      servers:
+        - url: http://127.0.0.1:9090
+          description: Edge Daemon
+      responses:
+        "200":
+          description: Daemon alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+
+  /api/hardware/state:
+    get:
+      tags: [edge-daemon]
+      summary: Full hardware snapshot
+      description: |
+        Returns the raw hardware state as seen by the C++ daemon. All fields
+        are in camelCase to match the Go client structs. The control-api
+        proxies this as `/api/state` after merging lease and sim fields.
+
+        Key difference from `/api/state`: includes `safety.faults` as a
+        structured object, live `lidar.last_distance_m`, and the raw
+        `motion.yaw_deg` / `motion.pitch_deg` float positions.
+      operationId: edge.getState
+      servers:
+        - url: http://127.0.0.1:9090
+          description: Edge Daemon
+      responses:
+        "200":
+          description: Hardware snapshot (camelCase).
+          content:
+            application/json:
+              schema:
+                type: object
+                description: |
+                  Raw hardware snapshot. Shape matches the Go `scanner.Snapshot`
+                  struct that the edgeclient unmarshals into.
+
+  /api/hardware/command:
+    post:
+      tags: [edge-daemon]
+      summary: Execute a hardware command
+      description: |
+        Dispatches a command directly to the edge daemon. In production the
+        control-api is the only caller (it enforces lease semantics before
+        forwarding). Available commands mirror the control-api command set.
+
+        The edge daemon does NOT enforce user identity or lease — that gate
+        lives entirely in the control-api layer.
+      operationId: edge.command
+      servers:
+        - url: http://127.0.0.1:9090
+          description: Edge Daemon
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [command]
+              properties:
+                command:
+                  type: string
+                  example: "home"
+                axis:
+                  type: string
+                  description: Required for `jog`.
+                delta:
+                  type: number
+                  description: Degrees to jog. Required for `jog`.
+                resolution:
+                  type: string
+                  description: Required for `set_resolution`.
+      responses:
+        "200":
+          description: Command accepted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  state:
+                    type: object
+                    description: Updated hardware snapshot.
+                  error:
+                    type: string
+                    nullable: true
+        "409":
+          description: Command rejected in current state (e.g. jog while scanning).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/config:
+    get:
+      tags: [edge-daemon, config]
+      summary: Full effective config
+      description: |
+        Returns the complete hardware configuration as loaded from
+        `/etc/prism-scanner/hardware.json`. Keys are snake_case. Useful for
+        debugging; not proxied through the control-api.
+      operationId: edge.getConfig
+      servers:
+        - url: http://127.0.0.1:9090
+          description: Edge Daemon
+      responses:
+        "200":
+          description: Full config object (snake_case).
+          content:
+            application/json:
+              schema:
+                type: object
+                description: Complete hardware.json contents as parsed.
+
+  /api/config/motion:
+    get:
+      tags: [edge-daemon, config]
+      summary: Get motion envelope (edge daemon)
+      description: |
+        Returns just the `motion` section of hardware.json. The control-api
+        proxies this as `GET /api/config/motion` on port 8080.
+      operationId: edge.getMotionConfig
+      servers:
+        - url: http://127.0.0.1:9090
+          description: Edge Daemon
+      responses:
+        "200":
+          description: Current motion config.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MotionConfig"
+
+    put:
+      tags: [edge-daemon, config]
+      summary: Update motion envelope (edge daemon)
+      description: |
+        Validates, applies, and persists new motion limits. Does NOT check
+        lease — that is the control-api's responsibility.
+
+        Validation rules:
+        - `min_deg` must be < `max_deg`
+        - `max_speed_deg_s` must be > 0
+        - `accel_deg_s2` must be > 0
+        - Current axis position must fall inside the new envelope
+
+        On success, the new config is written atomically to
+        `/etc/prism-scanner/hardware.json` (write-to-tmp + rename).
+      operationId: edge.updateMotionConfig
+      servers:
+        - url: http://127.0.0.1:9090
+          description: Edge Daemon
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MotionConfig"
+      responses:
+        "200":
+          description: Config applied and persisted.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  motion:
+                    $ref: "#/components/schemas/MotionConfig"
+        "400":
+          description: Validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+tags:
+  - name: control-api
+    description: Operator-facing endpoints on port 8080. Safe to expose via Tailscale Serve.
+  - name: edge-daemon
+    description: Hardware-layer endpoints on port 9090. Localhost only — proxied by control-api.
+  - name: config
+    description: Runtime configuration endpoints. Motion limits are hot-swappable; GPIO/safety require a daemon restart.

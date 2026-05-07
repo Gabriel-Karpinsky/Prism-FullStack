@@ -135,6 +135,61 @@
                 <div id="fault-banner" class="fault-banner hidden"></div>
             </section>
 
+            <section class="panel panel-motion-config">
+                <div class="panel-head">
+                    <h2>Motion limits</h2>
+                    <p>Live-editable envelope — requires control lease. Changes persist to hardware.json immediately.</p>
+                </div>
+
+                <div class="motion-axes">
+                    <fieldset class="motion-axis">
+                        <legend>Yaw</legend>
+                        <label class="field-inline">
+                            <span>Min (°)</span>
+                            <input id="mc-yaw-min" type="number" step="0.5" min="-180" max="0">
+                        </label>
+                        <label class="field-inline">
+                            <span>Max (°)</span>
+                            <input id="mc-yaw-max" type="number" step="0.5" min="0" max="180">
+                        </label>
+                        <label class="field-inline">
+                            <span>Speed (°/s)</span>
+                            <input id="mc-yaw-speed" type="number" step="0.5" min="0.5" max="90">
+                        </label>
+                        <label class="field-inline">
+                            <span>Accel (°/s²)</span>
+                            <input id="mc-yaw-accel" type="number" step="1" min="1" max="360">
+                        </label>
+                    </fieldset>
+
+                    <fieldset class="motion-axis">
+                        <legend>Pitch</legend>
+                        <label class="field-inline">
+                            <span>Min (°)</span>
+                            <input id="mc-pitch-min" type="number" step="0.5" min="-90" max="0">
+                        </label>
+                        <label class="field-inline">
+                            <span>Max (°)</span>
+                            <input id="mc-pitch-max" type="number" step="0.5" min="0" max="90">
+                        </label>
+                        <label class="field-inline">
+                            <span>Speed (°/s)</span>
+                            <input id="mc-pitch-speed" type="number" step="0.5" min="0.5" max="90">
+                        </label>
+                        <label class="field-inline">
+                            <span>Accel (°/s²)</span>
+                            <input id="mc-pitch-accel" type="number" step="1" min="1" max="360">
+                        </label>
+                    </fieldset>
+                </div>
+
+                <div class="button-row">
+                    <button id="motion-apply-btn" class="btn btn-primary">Apply limits</button>
+                    <button id="motion-reset-btn" class="btn btn-muted">Reset to loaded</button>
+                </div>
+                <p id="motion-config-status" class="status-line"></p>
+            </section>
+
             <section class="panel panel-log">
                 <div class="panel-head">
                     <h2>Activity log</h2>

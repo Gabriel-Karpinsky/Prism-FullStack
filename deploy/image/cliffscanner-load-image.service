@@ -1,0 +1,22 @@
+[Unit]
+# Loads the baked control-api container image from the rootfs tarball into
+# the local Docker image store on first boot. The .img.xz ships
+# /var/lib/cliffscanner/control-api.tar (produced by `docker save` on the CI
+# runner); this unit runs `docker load` once and then deletes the tarball
+# both to reclaim ~80–150 MiB on disk and to mark the load as done. After
+# successful load the image exists under its full GHCR tag, which matches
+# what docker-compose.yml references — so no network is needed.
+Description=Load baked control-api Docker image
+Requires=docker.service
+After=docker.service
+Before=cliffscanner-control-api.service
+ConditionPathExists=/var/lib/cliffscanner/control-api.tar
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/docker load -i /var/lib/cliffscanner/control-api.tar
+ExecStartPost=/bin/rm -f /var/lib/cliffscanner/control-api.tar
+
+[Install]
+WantedBy=multi-user.target

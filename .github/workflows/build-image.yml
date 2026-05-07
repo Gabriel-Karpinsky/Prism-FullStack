@@ -37,32 +37,47 @@ permissions:
   packages: write   # docker push to GHCR
 
 env:
-  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/cliffscanner-control-api
-  # Pin a known-good Pi OS Lite 64-bit. Bump this every ~6 months — the URL
-  # 404s when Raspberry Pi rotates the release. See "Risks" in the plan doc.
-  RPIOS_URL: https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64-lite.img.xz
+  # Opt every JS action into the Node 24 runtime ahead of GitHub forcing it
+  # in June 2026. Silences the deprecation warnings that the v3/v4/v6 action
+  # pins still emit on Node 20.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: 'true'
 
 jobs:
   build-control-api:
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.version.outputs.value }}
-      image_ref: ${{ steps.version.outputs.image_ref }}
+      version:    ${{ steps.version.outputs.value }}
+      image_ref:  ${{ steps.version.outputs.image_ref }}
+      ghcr_image: ${{ steps.version.outputs.ghcr_image }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Resolve version
+      - name: Resolve version + lowercase image ref
         id: version
+        # GHCR rejects mixed-case repository components, but ${{ github.repository_owner }}
+        # preserves the original casing (e.g. "Gabriel-Karpinsky"). Lowercase it once
+        # here and emit every derived name as a step output so later steps don't have
+        # to re-do the dance.
+        env:
+          OWNER: ${{ github.repository_owner }}
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
-          if [ -n "${{ inputs.version }}" ]; then
-            v="${{ inputs.version }}"
+          owner_lc="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          ghcr_image="ghcr.io/${owner_lc}/cliffscanner-control-api"
+
+          if [ -n "${INPUT_VERSION}" ]; then
+            v="${INPUT_VERSION}"
           elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
             v="${GITHUB_REF_NAME}"
           else
             v="dev-$(echo "${GITHUB_SHA}" | cut -c1-7)"
           fi
-          echo "value=${v}"                          >> "$GITHUB_OUTPUT"
-          echo "image_ref=${GHCR_IMAGE}:${v}"        >> "$GITHUB_OUTPUT"
+
+          {
+            echo "value=${v}"
+            echo "ghcr_image=${ghcr_image}"
+            echo "image_ref=${ghcr_image}:${v}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -90,17 +105,41 @@ jobs:
             VERSION=${{ steps.version.outputs.value }}
           tags: |
             ${{ steps.version.outputs.image_ref }}
-            ${{ env.GHCR_IMAGE }}:latest
+            ${{ steps.version.outputs.ghcr_image }}:latest
           # Layer cache lives in the same registry — no external cache infra.
-          cache-from: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache
-          cache-to: type=registry,ref=${{ env.GHCR_IMAGE }}:buildcache,mode=max
+          cache-from: type=registry,ref=${{ steps.version.outputs.ghcr_image }}:buildcache
+          cache-to:   type=registry,ref=${{ steps.version.outputs.ghcr_image }}:buildcache,mode=max
 
   build-pi-image:
     needs: build-control-api
     runs-on: ubuntu-latest
+    # Build both Lite (headless, the production target) and Desktop (full
+    # Raspberry Pi OS with LXDE — handy for on-device debugging via HDMI
+    # without needing a separate dev card). Both variants are produced on
+    # every workflow run; failures in one don't cancel the other so we
+    # always get at least one artifact.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: lite
+            url: https://downloads.raspberrypi.com/raspios_lite_arm64/images/raspios_lite_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64-lite.img.xz
+            # Lite ships ~1.5 GiB free; needs the full 2 GiB grow for our apt
+            # + edge-daemon build + control-api docker-save tarball (~150 MiB).
+            enlarge_mib: 2048
+          - variant: desktop
+            url: https://downloads.raspberrypi.com/raspios_arm64/images/raspios_arm64-2024-11-19/2024-11-19-raspios-bookworm-arm64.img.xz
+            # Desktop base is ~2.7 GiB and already has packages installed, so
+            # after adding Docker CE + build tools the compiler has very little
+            # temp space. 2 GiB matches lite; keeps g++ from running out of
+            # disk mid-compilation under qemu.
+            enlarge_mib: 2048
     env:
       VERSION: ${{ needs.build-control-api.outputs.version }}
       CONTROL_API_IMAGE: ${{ needs.build-control-api.outputs.image_ref }}
+      VARIANT: ${{ matrix.variant }}
+      RPIOS_URL: ${{ matrix.url }}
+      ENLARGE_MIB: ${{ matrix.enlarge_mib }}
     steps:
       - uses: actions/checkout@v4
 
@@ -116,18 +155,24 @@ jobs:
         id: cache-rpios
         uses: actions/cache@v4
         with:
+          # One cache slot per variant; key includes the URL so a URL bump
+          # in the matrix invalidates automatically.
           path: workspace/raspios.img.xz
-          key: rpios-${{ hashFiles('.github/workflows/build-image.yml') }}
+          key: rpios-${{ matrix.variant }}-${{ hashFiles('.github/workflows/build-image.yml') }}
 
-      - name: Download Raspberry Pi OS Lite 64-bit
+      - name: Download Raspberry Pi OS ${{ matrix.variant }} 64-bit
         if: steps.cache-rpios.outputs.cache-hit != 'true'
         run: |
           mkdir -p workspace
           curl -fL --retry 3 -o workspace/raspios.img.xz "${RPIOS_URL}"
 
-      - name: Decompress base image
+      - name: Decompress base image to CustoPiZer's expected path
+        # CustoPiZer hard-codes the input filename as workspace/input.img and
+        # writes the result back to workspace/output.img. Renaming saves
+        # config faff inside the container.
         run: |
           xz -dk -T0 workspace/raspios.img.xz
+          mv workspace/raspios.img workspace/input.img
           ls -lh workspace/
 
       - name: Stage CustoPiZer scripts
@@ -139,36 +184,76 @@ jobs:
           cp deploy/image/customize.sh workspace/scripts/01-cliffscanner.sh
           chmod +x workspace/scripts/01-cliffscanner.sh
 
-      - name: Run CustoPiZer (qemu-arm64 chroot bake)
+          # CustoPiZer exposes files staged below scripts/files inside the
+          # image build at /files. Keep the source payload there instead of
+          # relying on Docker bind mounts, which are only visible to the outer
+          # CustoPiZer container and not necessarily inside the chroot.
+          rm -rf workspace/scripts/files/repo
+          mkdir -p workspace/scripts/files/repo
+          cp -a apps deploy docs workspace/scripts/files/repo/
+          find workspace/scripts/files/repo -maxdepth 1 -mindepth 1 -type d -print
+
+      - name: Log in to GHCR (for image save)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bake control-api image into rootfs as docker-save tarball
+        # Running dockerd inside the qemu-aarch64 CustoPiZer chroot is fragile
+        # (cgroup + binfmt mismatches), so we do the pull on the host runner
+        # — where Docker happily pulls arm64 manifests via the registry — and
+        # ship the resulting `docker save` tarball inside the image. A oneshot
+        # systemd unit on the Pi runs `docker load` against this file before
+        # the control-api compose service starts, so first boot needs zero
+        # network for the container path.
         run: |
-          # Bind-mount the repo at /repo inside the chroot. customize.sh
-          # reads from there and writes the final layout into the image.
+          docker pull --platform linux/arm64 "${CONTROL_API_IMAGE}"
+          mkdir -p workspace/scripts/files
+          docker save "${CONTROL_API_IMAGE}" \
+              -o workspace/scripts/files/control-api.tar
+          ls -lh workspace/scripts/files/control-api.tar
+
+      - name: Run CustoPiZer (qemu-aarch64 chroot bake)
+        # EDITBASE_ARCH defaults to armv7l, which would make qemu pick the
+        # 32-bit interpreter and chroot would refuse our arm64 base. Override
+        # to aarch64 so the 64-bit Raspberry Pi OS image mounts and runs.
+        # EDITBASE_IMAGE_ENLARGEROOT (in MiB) gives the chroot headroom for
+        # apt + the edge-daemon build + the docker pull; Pi OS Lite ships
+        # with ~1.5 GiB free which is too tight.
+        run: |
           docker run --rm --privileged \
               -v "${PWD}/workspace:/CustoPiZer/workspace" \
-              -v "${PWD}:/repo" \
+              -e EDITBASE_ARCH=aarch64 \
+              -e EDITBASE_IMAGE_ENLARGEROOT="${ENLARGE_MIB}" \
               -e CONTROL_API_IMAGE="${CONTROL_API_IMAGE}" \
               -e CLIFFSCANNER_VERSION="${VERSION}" \
+              -e CLIFFSCANNER_VARIANT="${VARIANT}" \
               ghcr.io/octoprint/custopizer:latest
 
-      - name: Compress final image
+      - name: Rename + compress final image
         run: |
-          mv workspace/raspios.img "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
-          xz -T0 -9 -e "workspace/cliffscanner-pi-aarch64-${VERSION}.img"
+          sudo chown "$(id -u):$(id -g)" workspace/output.img
+          out="cliffscanner-pi-aarch64-${VARIANT}-${VERSION}.img"
+          mv workspace/output.img "workspace/${out}"
+          xz -T0 -9 -e "workspace/${out}"
           ls -lh workspace/
 
       - name: Compute checksums
         run: |
           cd workspace
-          sha256sum "cliffscanner-pi-aarch64-${VERSION}.img.xz" \
-              > "cliffscanner-pi-aarch64-${VERSION}.img.xz.sha256"
+          sha256sum "cliffscanner-pi-aarch64-${VARIANT}-${VERSION}.img.xz" \
+              > "cliffscanner-pi-aarch64-${VARIANT}-${VERSION}.img.xz.sha256"
 
       - name: Upload artifact (workflow_dispatch + tag both)
         uses: actions/upload-artifact@v4
         with:
-          name: cliffscanner-pi-aarch64-${{ env.VERSION }}
+          # Per-variant artifact name so both lite + desktop can coexist.
+          name: cliffscanner-pi-aarch64-${{ matrix.variant }}-${{ env.VERSION }}
           path: |
-            workspace/cliffscanner-pi-aarch64-*.img.xz
-            workspace/cliffscanner-pi-aarch64-*.img.xz.sha256
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz.sha256
           if-no-files-found: error
           retention-days: 14
 
@@ -176,8 +261,9 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
+          # Both matrix legs upload to the same Release; softprops appends.
           files: |
-            workspace/cliffscanner-pi-aarch64-*.img.xz
-            workspace/cliffscanner-pi-aarch64-*.img.xz.sha256
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz
+            workspace/cliffscanner-pi-aarch64-${{ matrix.variant }}-*.img.xz.sha256
           generate_release_notes: true
           fail_on_unmatched_files: true

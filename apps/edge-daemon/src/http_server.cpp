@@ -25,6 +25,7 @@
 #include <nlohmann/json.hpp>
 
 #include "edge_daemon.hpp"
+#include "systemd_notify.hpp"
 
 #ifdef __linux__
 #include <arpa/inet.h>
@@ -171,6 +172,11 @@ int HttpServer::Run() {
     return 1;
   }
 
+  // Listening socket is up — tell systemd we're done starting. Without
+  // this READY=1, a Type=notify unit hits TimeoutStartSec, gets killed,
+  // and dependents (control-api) fail with result 'dependency'.
+  edge::SystemdNotify("READY=1");
+
   while (!shutdown_.load()) {
     pollfd pfd{server_fd, POLLIN, 0};
     const int ready = ::poll(&pfd, 1, 500);  // periodic wakeup to observe shutdown_
@@ -179,11 +185,26 @@ int HttpServer::Run() {
     const int client_fd = ::accept(server_fd, nullptr, nullptr);
     if (client_fd < 0) continue;
 
+    // Cap how long we'll wait for the client to finish sending its request.
+    // Without this, a half-open connection (e.g. `nc 127.0.0.1 9090` with
+    // nothing typed) blocks recv() indefinitely, so RequestShutdown() / the
+    // shutdown_ flag can't be observed and `systemctl stop` hangs for the
+    // full TimeoutStopSec (default 90s). With the timeout, recv() returns
+    // EAGAIN after 1s and the outer loop re-checks shutdown_.
+    {
+      timeval tv{1, 0};  // 1 second
+      ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
     std::string raw;
     char buffer[4096];
-    while (true) {
+    while (!shutdown_.load()) {
       const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer), 0);
-      if (n <= 0) break;
+      if (n < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) continue;  // SO_RCVTIMEO fired, re-check shutdown_
+        break;  // real socket error
+      }
+      if (n == 0) break;  // client closed cleanly
       raw.append(buffer, static_cast<std::size_t>(n));
       const auto hend = raw.find("\r\n\r\n");
       if (hend == std::string::npos) continue;
