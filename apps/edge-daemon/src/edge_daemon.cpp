@@ -120,6 +120,13 @@ bool EdgeDaemon::Healthy() const {
 }
 
 Snapshot EdgeDaemon::GetSnapshot() const {
+  // Any in-flight HTTP request proves the host (control-api) is alive, so
+  // state polls keep the safety watchdog fed even when no motion command
+  // is being issued. Without this, a freshly booted daemon with no client
+  // commanding it (just polling) would trip host_watchdog after 1500 ms
+  // and latch a fault before the operator clicks anything.
+  if (safety_) safety_->Heartbeat();
+
   std::scoped_lock lock(mutex_);
   Snapshot s = state_;
   s.yaw   = Round(motion_->yaw_deg(),   100.0);

@@ -101,6 +101,10 @@ Config DefaultConfig() {
   Config c{};
   c.motion.yaw   = {-50.0,  50.0, 18.0, 60.0};
   c.motion.pitch = {-30.0,  30.0, 12.0, 40.0};
+  // 200 full steps × 128 microsteps × 1.0 gear ratio / 360° = 71.11 microsteps/°.
+  // The TB6600's S1/S2/S3 DIP switches must be set to 128 to match. Moves long
+  // enough to overflow pigpio's single-waveform limit are split and chained
+  // automatically by PigpioGpioBackend — see docs/hardware-setup.md.
   c.mechanics = {200, 128, 1.0, 1.0};
   c.gpio = {17, 27, 22, 23, 24, 25, 18,
             /*step_active_low=*/true,

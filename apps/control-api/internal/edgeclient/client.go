@@ -3,6 +3,7 @@ package edgeclient
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -56,7 +57,7 @@ func (c *Client) Command(command string, payload map[string]any) (scanner.Snapsh
 		return scanner.Snapshot{}, err
 	}
 	if response.Error != "" {
-		return scanner.Snapshot{}, fmt.Errorf(response.Error)
+		return scanner.Snapshot{}, errors.New(response.Error)
 	}
 	return response.State, nil
 }
@@ -155,7 +156,7 @@ func decodeError(response *http.Response) error {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err == nil {
 		if message, ok := payload["error"].(string); ok && message != "" {
-			return fmt.Errorf(message)
+			return errors.New(message)
 		}
 	}
 

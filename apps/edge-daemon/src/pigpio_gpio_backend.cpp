@@ -25,6 +25,7 @@ namespace edge {
 namespace {
 
 constexpr int kWaveMaxPulses = 11500;  // pigpio wave buffer headroom below 12000.
+constexpr std::size_t kMaxWaveChunks = 8;  // chained-waveform ceiling (~92k pulses).
 
 struct WaveEvent {
   std::uint32_t time_us;
@@ -117,32 +118,46 @@ class PigpioGpioBackend final : public IGpioBackend {
 
     auto pulses = EventsToPigpioPulses(events);
 
-    // If the waveform is too large for a single buffer, chop and chain.
-    // For typical moves (<6000 steps), a single wave is plenty.
-    if (pulses.size() > kWaveMaxPulses) {
-      error = "waveform too large (" + std::to_string(pulses.size()) +
-              " pulses); chaining not yet implemented";
-      return false;
-    }
-
+    // pigpio caps a single waveform at ~12000 pulses. A long move (e.g. a
+    // full-travel seek at 128 microsteps) is split into chunks of
+    // kWaveMaxPulses; gpioWaveChain then transmits them seamlessly so the
+    // motor still sees one continuous trapezoidal profile with no mid-move
+    // pause. usDelay was computed from the absolute event timeline, so the
+    // delay at a chunk boundary already carries the gap to the next chunk.
     gpioWaveClear();
-    if (gpioWaveAddGeneric(static_cast<unsigned>(pulses.size()), pulses.data()) < 0) {
-      error = "gpioWaveAddGeneric failed";
-      return false;
+    std::vector<int> wave_ids;
+    for (std::size_t off = 0; off < pulses.size(); off += kWaveMaxPulses) {
+      const unsigned n = static_cast<unsigned>(
+          std::min<std::size_t>(kWaveMaxPulses, pulses.size() - off));
+      if (gpioWaveAddGeneric(n, pulses.data() + off) < 0 ||
+          wave_ids.size() >= kMaxWaveChunks) {
+        for (int id : wave_ids) gpioWaveDelete(id);
+        error = "move too large for pigpio wave memory; reduce travel distance";
+        return false;
+      }
+      const int id = gpioWaveCreate();
+      if (id < 0) {
+        for (int existing : wave_ids) gpioWaveDelete(existing);
+        error = "gpioWaveCreate failed (out of pigpio wave memory)";
+        return false;
+      }
+      wave_ids.push_back(id);
     }
-    const int wave_id = gpioWaveCreate();
-    if (wave_id < 0) {
-      error = "gpioWaveCreate failed";
-      return false;
-    }
+    if (wave_ids.empty()) return true;
 
-    if (gpioWaveTxSend(wave_id, PI_WAVE_MODE_ONE_SHOT) < 0) {
-      gpioWaveDelete(wave_id);
-      error = "gpioWaveTxSend failed";
-      return false;
-    }
+    // gpioWaveChain takes wave ids as raw bytes; ids are small integers.
+    std::vector<char> chain;
+    chain.reserve(wave_ids.size());
+    for (int id : wave_ids) chain.push_back(static_cast<char>(id));
 
     busy_.store(true);
+    if (gpioWaveChain(chain.data(), static_cast<int>(chain.size())) < 0) {
+      busy_.store(false);
+      for (int id : wave_ids) gpioWaveDelete(id);
+      error = "gpioWaveChain failed";
+      return false;
+    }
+
     while (gpioWaveTxBusy()) {
       if (abort_requested_.load()) {
         gpioWaveTxStop();
@@ -151,7 +166,7 @@ class PigpioGpioBackend final : public IGpioBackend {
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     busy_.store(false);
-    gpioWaveDelete(wave_id);
+    for (int id : wave_ids) gpioWaveDelete(id);
     return true;
   }
 

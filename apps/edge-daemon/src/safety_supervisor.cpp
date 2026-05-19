@@ -94,6 +94,15 @@ void SafetySupervisor::RunLoop() {
     }
     if (current != FaultCode::None) continue;
 
+    // The host watchdog is a *motion-safety* mechanism: it exists to stop
+    // the gantry if the control-api crashes mid-scan, leaving motors driven
+    // and unsupervised. When motion is idle (no DMA waveform on the bus),
+    // a stale heartbeat is benign — there's nothing dangerous to abort, and
+    // we don't want a fault to latch before the operator has even clicked
+    // anything. Only enforce the timeout while the motion controller is
+    // actively executing a move.
+    if (!motion_.is_busy()) continue;
+
     const auto since = std::chrono::steady_clock::now() - last;
     if (since > watchdog_ms) {
       TriggerFault(FaultCode::HostWatchdog,
