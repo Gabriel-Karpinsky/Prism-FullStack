@@ -69,13 +69,15 @@
                 </div>
 
                 <label class="field">
-                    <span>Resolution</span>
+                    <span>Scan density</span>
                     <select id="resolution-select">
-                        <option value="low">Low</option>
-                        <option value="medium" selected>Medium</option>
-                        <option value="high">High</option>
+                        <option value="coarse">Coarse — every 4 full steps</option>
+                        <option value="standard" selected>Standard — 1 full step</option>
+                        <option value="fine">Fine — every ⅛ step</option>
+                        <option value="max">Maximum — every microstep</option>
                     </select>
                 </label>
+                <p id="resolution-detail" class="status-line">Scan grid: —</p>
 
                 <p id="command-status" class="status-line">Waiting for scanner state...</p>
             </section>

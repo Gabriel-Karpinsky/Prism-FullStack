@@ -376,9 +376,9 @@ curl -s http://127.0.0.1:9090/api/hardware/state | jq '{connected,mode,faults}'
    axis runs backwards, flip `dir_active_low` for that axis or swap the driver
    `DIR` wiring.
 
-**d. First scan** (resolution `low`)
+**d. First scan** (scan density `coarse`)
 
-1. Set resolution to `low`, start the scan.
+1. Set scan density to `coarse` (fewest sample points — fastest), start the scan.
 2. Confirm the gantry rasters in a back-and-forth (boustrophedon) pattern.
 3. Confirm `coverage` and `scanProgress` climb.
 4. Confirm the browser heatmap fills cell by cell.

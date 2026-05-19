@@ -19,7 +19,11 @@ struct ScanSettings {
   double pitch_min = -20.0;
   double pitch_max = 35.0;
   double sweep_speed_deg_per_sec = 20.0;
-  std::string resolution = "medium";
+  // Resolution preset: coarse | standard | fine | max. Each maps to a
+  // sampling stride in microsteps (see EdgeDaemon::ApplyResolutionLocked).
+  std::string resolution = "standard";
+  // Microsteps the head advances between samples; derived from the preset.
+  int sample_stride_microsteps = 0;
 };
 
 struct Metrics {

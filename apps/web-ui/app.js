@@ -22,6 +22,7 @@ const el = {
   latencyValue: document.getElementById("latency-value"),
   progressFill: document.getElementById("progress-fill"),
   scanDurationValue: document.getElementById("scan-duration-value"),
+  resolutionDetail: document.getElementById("resolution-detail"),
   faultBanner: document.getElementById("fault-banner"),
   activityLog: document.getElementById("activity-log"),
   mapCanvas: document.getElementById("surface-map"),
@@ -155,6 +156,32 @@ function renderLog(activity = []) {
   });
 }
 
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds || 0));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
+  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+}
+
+// Scan density: resolution presets map to a microstep stride; the grid size
+// and scan-time estimate fall out of that and the motion range. This caption
+// makes the real numbers visible so the preset choice isn't a black box.
+function renderScanDensity(snapshot) {
+  const grid = snapshot.grid || [];
+  const rows = grid.length;
+  const cols = rows > 0 ? grid[0].length : 0;
+  const stride = snapshot.scanSettings.sampleStrideMicrosteps || 0;
+  let detail = `Scan grid: ${cols} × ${rows} samples`;
+  if (stride > 0) {
+    detail += ` · stride ${stride} µstep${stride === 1 ? "" : "s"}`;
+  }
+  detail += ` · est. ${formatDuration(snapshot.scanDurationSeconds)}`;
+  if (cols * rows > 250000) {
+    detail += " · grid clamped — narrow the scan range for finer detail";
+  }
+  el.resolutionDetail.textContent = detail;
+}
+
 function render(snapshot) {
   state.snapshot = snapshot;
   el.controlOwner.textContent = snapshot.controlOwner || "Unclaimed";
@@ -166,8 +193,9 @@ function render(snapshot) {
   el.motorTempValue.textContent = `${snapshot.metrics.motorTempC.toFixed(1)} C`;
   el.latencyValue.textContent = `${snapshot.metrics.latencyMs} ms`;
   el.progressFill.style.width = `${Math.round(snapshot.scanProgress * 100)}%`;
-  el.scanDurationValue.textContent = `Estimated duration: ${snapshot.scanDurationSeconds.toFixed(0)}s`;
+  el.scanDurationValue.textContent = `Estimated duration: ${formatDuration(snapshot.scanDurationSeconds)}`;
   el.resolutionSelect.value = snapshot.scanSettings.resolution;
+  renderScanDensity(snapshot);
 
   if (snapshot.faults && snapshot.faults.length > 0) {
     el.faultBanner.classList.remove("hidden");
