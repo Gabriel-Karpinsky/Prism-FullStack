@@ -476,20 +476,50 @@ double EdgeDaemon::TargetPitchForCell(int y, int height) const {
 }
 
 void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
-  int width  = config_.service.grid_width;
-  int height = config_.service.grid_height;
-  if (resolution == "low") {
-    width = 24; height = 12;
-  } else if (resolution == "high") {
-    width  = std::max(72, config_.service.grid_width  + config_.service.grid_width  / 2);
-    height = std::max(36, config_.service.grid_height + config_.service.grid_height / 2);
+  // Memory/transmission backstop: a per-microstep scan over the full envelope
+  // is tens of millions of cells. Clamp the stored grid to this and tell the
+  // operator to narrow the scan range for genuine per-microstep detail.
+  constexpr long kMaxScanCells = 300000;
+
+  const std::string preset = resolution.empty() ? state_.scan_settings.resolution : resolution;
+  const int ms = std::max(1, config_.mechanics.microsteps);
+
+  // Resolution presets are grounded in hardware: the scan head advances a
+  // fixed number of microsteps between samples. "max" samples every single
+  // microstep (the finest the driver can resolve); coarser presets stride by
+  // whole motor steps.
+  int stride;
+  if      (preset == "max")    stride = 1;
+  else if (preset == "fine")   stride = std::max(1, ms / 8);
+  else if (preset == "coarse") stride = std::max(1, ms * 4);
+  else                         stride = ms;  // "standard" (and anything else) = 1 full step
+
+  // Grid dimensions fall out of the scan range, microstep density and stride.
+  const double yaw_span   = std::max(0.0, state_.scan_settings.yaw_max   - state_.scan_settings.yaw_min);
+  const double pitch_span = std::max(0.0, state_.scan_settings.pitch_max - state_.scan_settings.pitch_min);
+  long width  = static_cast<long>(yaw_span   * config_.mechanics.yaw_microsteps_per_deg()   / stride) + 1;
+  long height = static_cast<long>(pitch_span * config_.mechanics.pitch_microsteps_per_deg() / stride) + 1;
+  width  = std::max(2L, width);
+  height = std::max(2L, height);
+
+  if (width * height > kMaxScanCells) {
+    const double scale = std::sqrt(static_cast<double>(kMaxScanCells) /
+                                   static_cast<double>(width * height));
+    width  = std::max(2L, static_cast<long>(static_cast<double>(width)  * scale));
+    height = std::max(2L, static_cast<long>(static_cast<double>(height) * scale));
+    AddLogLocked("scanner", "warn",
+                 "Requested density exceeds the " + std::to_string(kMaxScanCells) +
+                 "-cell limit; grid clamped — narrow the scan range for finer detail.");
   }
 
-  state_.scan_settings.resolution = resolution.empty() ? std::string("medium") : resolution;
-  state_.grid.assign(height, std::vector<double>(width, -1.0));
-  const double per_point_ms = 80.0;  // rough budget: move + settle + trigger + read
+  state_.scan_settings.resolution = preset;
+  state_.scan_settings.sample_stride_microsteps = stride;
+  state_.grid.assign(static_cast<std::size_t>(height),
+                     std::vector<double>(static_cast<std::size_t>(width), -1.0));
+
+  const double per_point_ms = 110.0;  // rough budget: move + settle + trigger + read
   state_.scan_duration_seconds =
-      Round((static_cast<double>(width) * height * per_point_ms) / 1000.0, 100.0);
+      Round((static_cast<double>(width) * static_cast<double>(height) * per_point_ms) / 1000.0, 100.0);
   ResetScanLocked();
 }
 

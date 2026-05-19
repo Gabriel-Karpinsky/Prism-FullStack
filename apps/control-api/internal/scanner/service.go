@@ -10,9 +10,13 @@ import (
 )
 
 const (
-	gridWidth    = 48
-	gridHeight   = 24
 	leaseSeconds = 120
+	// Sim stand-ins for the edge daemon's mechanics (200 full steps ×
+	// 128 microsteps ⇒ 71.11 microsteps/°). Lets the sim derive scan grids
+	// from resolution presets the same way the daemon does.
+	simMicrosteps       = 128
+	simMicrostepsPerDeg = 200.0 * simMicrosteps / 360.0
+	simMaxScanCells     = 300000
 )
 
 type state struct {
@@ -30,6 +34,8 @@ type state struct {
 	filledCells         int
 	lastCompletedScanAt *time.Time
 	grid                [][]float64
+	gridW               int
+	gridH               int
 	scanSettings        ScanSettings
 	metrics             Metrics
 	faults              []string
@@ -47,14 +53,13 @@ func NewService() *Service {
 		state: state{
 			connected: true,
 			mode:      "idle",
-			grid:      newGrid(),
 			scanSettings: ScanSettings{
 				YawMin:              -60,
 				YawMax:              60,
 				PitchMin:            -20,
 				PitchMax:            35,
 				SweepSpeedDegPerSec: 20,
-				Resolution:          "medium",
+				Resolution:          "standard",
 			},
 			metrics: Metrics{
 				MotorTempC:     31.4,
@@ -74,9 +79,64 @@ func NewService() *Service {
 		},
 	}
 
+	s.applyResolutionLocked(s.state.scanSettings.Resolution)
 	s.addLog("system", "info", "Go control API initialized.")
 	s.addLog("scanner", "info", "Scanner connected to simulated control bus.")
 	return s
+}
+
+// strideForResolution maps a preset name to a sampling stride in microsteps.
+func strideForResolution(preset string) int {
+	switch preset {
+	case "max":
+		return 1
+	case "fine":
+		return max(1, simMicrosteps/8)
+	case "coarse":
+		return max(1, simMicrosteps*4)
+	default: // "standard"
+		return simMicrosteps
+	}
+}
+
+func validResolution(preset string) bool {
+	switch preset {
+	case "coarse", "standard", "fine", "max":
+		return true
+	default:
+		return false
+	}
+}
+
+// applyResolutionLocked derives the scan grid from the preset's microstep
+// stride and the current motion range — mirroring EdgeDaemon::ApplyResolution.
+func (s *Service) applyResolutionLocked(preset string) {
+	if !validResolution(preset) {
+		preset = "standard"
+	}
+	stride := strideForResolution(preset)
+	yawSpan := s.state.scanSettings.YawMax - s.state.scanSettings.YawMin
+	pitchSpan := s.state.scanSettings.PitchMax - s.state.scanSettings.PitchMin
+
+	w := int(math.Max(0, yawSpan)*simMicrostepsPerDeg/float64(stride)) + 1
+	h := int(math.Max(0, pitchSpan)*simMicrostepsPerDeg/float64(stride)) + 1
+	w = max(2, w)
+	h = max(2, h)
+	if w*h > simMaxScanCells {
+		scale := math.Sqrt(float64(simMaxScanCells) / float64(w*h))
+		w = max(2, int(float64(w)*scale))
+		h = max(2, int(float64(h)*scale))
+		s.addLog("scanner", "warn", "Requested density exceeds the sim cell limit; grid clamped — narrow the scan range.")
+	}
+
+	s.state.gridW = w
+	s.state.gridH = h
+	s.state.grid = newGrid(w, h)
+	s.state.scanSettings.Resolution = preset
+	s.state.scanSettings.SampleStrideMicrosteps = stride
+	s.state.filledCells = 0
+	s.state.coverage = 0
+	s.state.scanProgress = 0
 }
 
 func (s *Service) Snapshot() Snapshot {
@@ -179,10 +239,13 @@ func (s *Service) Command(user, command string, payload map[string]any) (Snapsho
 		s.addLog("motion", "info", "Jogged "+axis+" by "+formatFloat(delta)+" degrees.")
 	case "set_resolution":
 		resolution := strings.ToLower(strings.TrimSpace(stringFromMap(payload, "resolution")))
-		if resolution != "low" && resolution != "medium" && resolution != "high" {
-			return Snapshot{}, errors.New("resolution must be low, medium, or high")
+		if !validResolution(resolution) {
+			return Snapshot{}, errors.New("resolution must be coarse, standard, fine, or max")
 		}
-		s.state.scanSettings.Resolution = resolution
+		if s.state.mode == "scanning" || s.state.mode == "paused" {
+			return Snapshot{}, errors.New("stop the current scan before changing resolution")
+		}
+		s.applyResolutionLocked(resolution)
 		s.addLog("scanner", "info", "Scan resolution set to "+resolution+".")
 	case "start_scan":
 		if !s.state.connected {
@@ -291,14 +354,15 @@ func validateMotionConfig(cfg MotionConfig) error {
 
 func (s *Service) updateLocked() {
 	s.clearExpiredLeaseLocked()
-	s.state.scanDurationSeconds = scanDurationForResolution(s.state.scanSettings.Resolution)
+	// ~110 ms per measure point (move + settle + trigger + read).
+	s.state.scanDurationSeconds = round2(float64(s.state.gridW*s.state.gridH) * 0.11)
 
 	switch s.state.mode {
 	case "scanning":
 		if s.state.scanStartedAt != nil {
 			elapsed := s.state.scanAccumulated + time.Since(*s.state.scanStartedAt).Seconds()
 			progress := clamp(elapsed/s.state.scanDurationSeconds, 0, 1)
-			targetFilled := int(math.Floor(progress * float64(gridWidth*gridHeight)))
+			targetFilled := int(math.Floor(progress * float64(s.state.gridW*s.state.gridH)))
 			s.fillToLocked(targetFilled)
 			s.state.scanProgress = round4(progress)
 			s.setHeadLocked(s.state.filledCells)
@@ -370,7 +434,7 @@ func (s *Service) requireControlLocked(user string) error {
 }
 
 func (s *Service) resetScanLocked() {
-	s.state.grid = newGrid()
+	s.state.grid = newGrid(s.state.gridW, s.state.gridH)
 	s.state.coverage = 0
 	s.state.scanProgress = 0
 	s.state.filledCells = 0
@@ -393,12 +457,12 @@ func (s *Service) addLog(source, level, message string) {
 }
 
 func (s *Service) fillToLocked(target int) {
-	maxCount := gridWidth * gridHeight
+	maxCount := s.state.gridW * s.state.gridH
 	target = int(clamp(float64(target), 0, float64(maxCount)))
 
 	for i := s.state.filledCells; i < target; i++ {
-		x, y := coordForIndex(i)
-		s.state.grid[y][x] = sampleHeight(x, y)
+		x, y := coordForIndex(i, s.state.gridW)
+		s.state.grid[y][x] = sampleHeight(x, y, s.state.gridW, s.state.gridH)
 	}
 
 	s.state.filledCells = target
@@ -406,17 +470,17 @@ func (s *Service) fillToLocked(target int) {
 }
 
 func (s *Service) setHeadLocked(index int) {
-	maxIndex := (gridWidth * gridHeight) - 1
+	maxIndex := (s.state.gridW * s.state.gridH) - 1
 	if index > maxIndex {
 		index = maxIndex
 	}
 
-	x, y := coordForIndex(index)
+	x, y := coordForIndex(index, s.state.gridW)
 	yawRange := s.state.scanSettings.YawMax - s.state.scanSettings.YawMin
 	pitchRange := s.state.scanSettings.PitchMax - s.state.scanSettings.PitchMin
 
-	s.state.yaw = round2(s.state.scanSettings.YawMin + (float64(x)/float64(max(1, gridWidth-1)))*yawRange)
-	s.state.pitch = round2(s.state.scanSettings.PitchMin + (float64(y)/float64(max(1, gridHeight-1)))*pitchRange)
+	s.state.yaw = round2(s.state.scanSettings.YawMin + (float64(x)/float64(max(1, s.state.gridW-1)))*yawRange)
+	s.state.pitch = round2(s.state.scanSettings.PitchMin + (float64(y)/float64(max(1, s.state.gridH-1)))*pitchRange)
 }
 
 func (s *Service) updateMetricsLocked() {
@@ -433,10 +497,10 @@ func (s *Service) updateMetricsLocked() {
 	s.state.metrics.LatencyMS = int(math.Round(36 + (scanLoad * 14.0) + ((1.0 - scanLoad) * 4.0) + (math.Abs(math.Sin(phase*0.45)) * 8)))
 }
 
-func newGrid() [][]float64 {
-	grid := make([][]float64, gridHeight)
+func newGrid(w, h int) [][]float64 {
+	grid := make([][]float64, h)
 	for y := range grid {
-		grid[y] = make([]float64, gridWidth)
+		grid[y] = make([]float64, w)
 		for x := range grid[y] {
 			grid[y][x] = -1
 		}
@@ -466,36 +530,28 @@ func cloneActivity(in []ActivityEntry) []ActivityEntry {
 	return append([]ActivityEntry{}, in...)
 }
 
-func coordForIndex(index int) (int, int) {
-	row := index / gridWidth
-	col := index % gridWidth
+func coordForIndex(index, w int) (int, int) {
+	if w < 1 {
+		w = 1
+	}
+	row := index / w
+	col := index % w
 	if row%2 == 1 {
-		col = (gridWidth - 1) - col
+		col = (w - 1) - col
 	}
 	return col, row
 }
 
-func sampleHeight(x, y int) float64 {
-	xf := (float64(x) / float64(max(1, gridWidth-1))) * 4.6
-	yf := (float64(y) / float64(max(1, gridHeight-1))) * 3.2
+func sampleHeight(x, y, w, h int) float64 {
+	xf := (float64(x) / float64(max(1, w-1))) * 4.6
+	yf := (float64(y) / float64(max(1, h-1))) * 3.2
 
-	value := 0.28 + (float64((gridHeight-1)-y)/float64(max(1, gridHeight-1)))*0.34
+	value := 0.28 + (float64((h-1)-y)/float64(max(1, h-1)))*0.34
 	value += math.Exp(-(math.Pow(xf-2.25, 2.0) * 1.55)) * 0.52
 	value += (math.Sin(xf*2.1) * 0.11) + (math.Cos(yf*3.5) * 0.07)
 	value -= math.Exp(-((math.Pow(xf-3.3, 2.0) + math.Pow(yf-1.25, 2.0)) * 3.8)) * 0.21
 
 	return round4(clamp(value, 0, 1))
-}
-
-func scanDurationForResolution(resolution string) float64 {
-	switch resolution {
-	case "low":
-		return 20
-	case "high":
-		return 56
-	default:
-		return 36
-	}
 }
 
 func timeStringPtr(t *time.Time) *string {

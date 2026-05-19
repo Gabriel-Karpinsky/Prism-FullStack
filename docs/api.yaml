@@ -80,8 +80,15 @@ components:
       properties:
         resolution:
           type: string
-          enum: [low, medium, high]
-          description: Grid density preset.
+          enum: [coarse, standard, fine, max]
+          description: >
+            Scan-density preset. Each maps to a sampling stride in microsteps:
+            max = 1 (every microstep), fine = ⅛ full step, standard = 1 full
+            step, coarse = 4 full steps. The grid dimensions are derived from
+            this stride and the motion range.
+        sampleStrideMicrosteps:
+          type: integer
+          description: Microsteps the head advances between samples (derived from the preset).
         yawMin:
           type: number
           format: double
@@ -192,7 +199,7 @@ components:
       description: |
         Optional parameters for specific commands:
         - `jog`: `{ axis: "yaw"|"pitch", delta: <degrees> }`
-        - `set_resolution`: `{ resolution: "low"|"medium"|"high" }`
+        - `set_resolution`: `{ resolution: "coarse"|"standard"|"fine"|"max" }`
         All other commands ignore the payload.
       additionalProperties: true
 
@@ -325,7 +332,7 @@ paths:
         | `connect` | No | — |
         | `home` | Yes | — |
         | `jog` | Yes | `axis` ("yaw"\|"pitch"), `delta` (degrees) |
-        | `set_resolution` | Yes | `resolution` ("low"\|"medium"\|"high") |
+        | `set_resolution` | Yes | `resolution` ("coarse"\|"standard"\|"fine"\|"max") |
         | `start_scan` | Yes | — |
         | `pause_scan` | Yes | — |
         | `resume_scan` | Yes | — |
@@ -519,6 +526,7 @@ paths:
                   description: Degrees to jog. Required for `jog`.
                 resolution:
                   type: string
+                  enum: [coarse, standard, fine, max]
                   description: Required for `set_resolution`.
       responses:
         "200":

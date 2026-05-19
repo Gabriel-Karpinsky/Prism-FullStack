@@ -8,12 +8,13 @@ type ActivityEntry struct {
 }
 
 type ScanSettings struct {
-	YawMin              float64 `json:"yawMin"`
-	YawMax              float64 `json:"yawMax"`
-	PitchMin            float64 `json:"pitchMin"`
-	PitchMax            float64 `json:"pitchMax"`
-	SweepSpeedDegPerSec float64 `json:"sweepSpeedDegPerSec"`
-	Resolution          string  `json:"resolution"`
+	YawMin                 float64 `json:"yawMin"`
+	YawMax                 float64 `json:"yawMax"`
+	PitchMin               float64 `json:"pitchMin"`
+	PitchMax               float64 `json:"pitchMax"`
+	SweepSpeedDegPerSec    float64 `json:"sweepSpeedDegPerSec"`
+	Resolution             string  `json:"resolution"`
+	SampleStrideMicrosteps int     `json:"sampleStrideMicrosteps"`
 }
 
 type Metrics struct {

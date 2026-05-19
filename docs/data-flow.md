@@ -229,6 +229,28 @@ flowchart TD
 - **Stop / e-stop** set `Stopping` and call `AbortMotion()`, which halts the
   DMA waveform mid-move. The worker sees `Stopping` and exits.
 
+### Scan density (resolution presets)
+
+The grid the worker rasters is not a fixed size — it is derived from hardware.
+`set_resolution` picks a **preset** that maps to a *sampling stride* in
+microsteps (`EdgeDaemon::ApplyResolutionLocked`):
+
+| Preset | Stride | Meaning |
+|---|---|---|
+| `coarse` | 4 full steps | fast survey |
+| `standard` | 1 full step | default |
+| `fine` | ⅛ full step | detailed |
+| `max` | 1 microstep | finest the driver can resolve |
+
+The grid dimensions fall out of the stride and the motion range:
+`cols = yaw_range° × microsteps_per_deg ÷ stride`, likewise for rows. So a
+finer preset — or a wider envelope — produces more sample cells and a longer
+scan. A per-microstep scan over the full envelope is tens of millions of
+cells, so the stored grid is clamped to `kMaxScanCells` (300 000) with a
+logged warning; genuine per-microstep detail comes from scanning a *small*
+yaw/pitch range. The web UI shows the resulting grid size and time estimate
+live under the density selector.
+
 ---
 
 ## 7. Motion: degrees → steps → DMA waveform
