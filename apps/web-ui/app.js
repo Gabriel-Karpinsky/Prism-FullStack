@@ -312,10 +312,14 @@ async function applyMotionConfig() {
     setMotionStatus("Pitch: min must be less than max.", true); return;
   }
   try {
-    const updated = await request("/api/config/motion", {
+    const response = await request("/api/config/motion", {
       method: "PUT",
       body: JSON.stringify({ user, motion }),
     });
+    // PUT replies with an envelope {ok, motion}; GET replies with the bare
+    // {yaw, pitch} config. Accept either so populateMotionFields never sees
+    // an undefined axis.
+    const updated = response.motion || response;
     state.loadedMotionConfig = updated;
     populateMotionFields(updated);
     setMotionStatus("Motion limits applied and persisted to device.");

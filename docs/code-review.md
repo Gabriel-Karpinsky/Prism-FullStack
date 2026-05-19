@@ -109,35 +109,34 @@ faults so the root cause is preserved).
 
 ### Critical
 
-**B1 — The host-watchdog faults an idle scanner.** This is the
-`host_watchdog: no host heartbeat in 1500ms` failure seen during deployment.
-`SafetySupervisor::Heartbeat()` is *only* called from
-`EdgeDaemon::ExecuteCommand` (`edge_daemon.cpp:188`). Plain state polling
-(`GetSnapshot`) does **not** heartbeat. So if the operator just opens the UI
-and doesn't click anything, no command flows for 1500 ms → the watchdog
-latches a fault. **Fix:** call `safety_->Heartbeat()` inside `GetSnapshot()`,
-and only enforce the watchdog while `motion_->is_busy()` (an idle machine has
-nothing to protect).
+**B1 — The host-watchdog faults an idle scanner.** ✅ **Fixed in `a3d6a69`.**
+This was the `host_watchdog: no host heartbeat in 1500ms` failure seen during
+deployment. `SafetySupervisor::Heartbeat()` used to be called *only* from
+`EdgeDaemon::ExecuteCommand`; plain state polling (`GetSnapshot`) did not
+heartbeat, so an idle scanner latched a fault after 1500 ms.
+**Fix applied:** `GetSnapshot()` now calls `safety_->Heartbeat()` — any HTTP
+poll feeds the watchdog — and the timeout is only enforced while motion is in
+flight.
 
-**B2 — `microsteps: 128` default can make moves fail outright.** With
-`c.mechanics = {200, 128, 1.0, 1.0}` (`hardware_config.cpp:104`),
-`microsteps_per_deg = 200·128/360 ≈ 71`. A full-envelope yaw move (100°) is
-~7100 steps; pitch ~4200. Each step becomes 2 wave events, so a corner-to-corner
-move generates ~11 000–13 000 `gpioPulse_t`. `kWaveMaxPulses` is 11 500
-(`pigpio_gpio_backend.cpp:27`) and the "chunk and chain" path is **not
-implemented** — it just returns `"waveform too large"`
-(`pigpio_gpio_backend.cpp:122`). Large moves fail and latch a fault. TB6600
-drivers only do 32 microsteps in hardware anyway. **Fix:** set `microsteps: 32`
-everywhere *and* either implement waveform chaining or reject the move with a
-clear planning-time error.
+**B2 — Large moves overflowed the pigpio waveform buffer.** ✅ **Fixed via
+waveform chaining.** At `microsteps: 128` (`microsteps_per_deg ≈ 71`), a
+full-envelope move generates ~11 000–13 000 `gpioPulse_t` — over the
+~12 000-pulse single-waveform limit. The old code returned
+`"waveform too large; chaining not yet implemented"` and the move failed.
+**Fix applied:** `PigpioGpioBackend::RunMotionWaveform` now splits an oversized
+pulse list into chunks of `kWaveMaxPulses` and transmits them with
+`gpioWaveChain`, so the motor sees one continuous trapezoidal profile. The
+default `microsteps` stays at **128** (the project's drivers support it). A
+move that still exceeds the chained ceiling returns a clear
+`"move too large for pigpio wave memory"` error instead of a cryptic one.
 
-**B3 — The motion-config "Apply" button breaks the UI.** `main.go:153` returns
-`{ok: true, motion: cfg}` on a successful PUT. But `app.js:315-320` does
-`const updated = await request(...)` then `populateMotionFields(updated)` —
-passing the *envelope* where `populateMotionFields` expects the bare
-`{yaw, pitch}` config. `updated.yaw` is `undefined` → `TypeError` → the panel
-errors and the fields go blank. The GET path works because GET returns the bare
-config. **Fix:** `populateMotionFields(updated.motion)`.
+**B3 — The motion-config "Apply" button breaks the UI.** ✅ **Fixed.**
+`main.go` returns `{ok: true, motion: cfg}` on a successful PUT, but `app.js`
+passed that whole envelope to `populateMotionFields`, which expects the bare
+`{yaw, pitch}` config — `updated.yaw` was `undefined` → `TypeError` → the panel
+errored and the fields went blank. **Fix applied:** `applyMotionConfig` now
+unwraps `response.motion` (falling back to the bare object so the GET path
+still works).
 
 ### High
 
@@ -165,11 +164,10 @@ drives to the wrong place. **Fix:** after an abort, force the operator to
 re-home before any further move; have `PlanMove`/`ExecuteCommand` refuse moves
 while `!position_known()`.
 
-**B7 — `fmt.Errorf` with a non-constant format string.** `client.go:60`
-`fmt.Errorf(response.Error)` and `client.go:159` `fmt.Errorf(message)`. If the
-daemon's error text contains a `%`, Go interprets it as a format verb and
-produces `%!s(MISSING)` garbage. `go vet` flags this. **Fix:**
-`errors.New(response.Error)` or `fmt.Errorf("%s", response.Error)`.
+**B7 — `fmt.Errorf` with a non-constant format string.** ✅ **Fixed.**
+`client.go` passed daemon-supplied error text straight into `fmt.Errorf` as the
+format string; a `%` in that text produced `%!s(MISSING)` garbage. **Fix
+applied:** both call sites now use `errors.New(...)`; `go vet` is clean.
 
 ### Medium
 
@@ -298,20 +296,20 @@ it before this repo is shared widely.
 
 ## 7. Action plan (priority order)
 
+**Done:** B1 (watchdog), B2 (waveform chaining), B3 (Apply button), B7
+(`fmt.Errorf`). Remaining:
+
 1. **`git rm -r --cached .gocache`** — 30 seconds, removes 100 MB of noise.
-2. **B1 (watchdog) + B2 (microsteps=32)** — the reasons deployment fails.
-   Highest impact.
-3. **B3 (`updated.motion`)** — one-line fix, unbreaks the config UI.
-4. **B4 + B5** — harden the daemon's HTTP parser; add Go server timeouts. The
+2. **B4 + B5** — harden the daemon's HTTP parser; add Go server timeouts. The
    daemon currently crashes on a malformed request.
-5. **B6** — make `position_known` actually block moves. A *physical safety* gap
+3. **B6** — make `position_known` actually block moves. A *physical safety* gap
    on a machine with motors.
-6. **B7, B9** — Go error-string and HTTP-status cleanups (quick).
-7. **B8 + B11** — offload blocking moves; add bounded I²C retries.
-8. **Performance #1** — stop shipping the full grid on every poll.
-9. **Delete dead code** (§5) — `proto/`, `radarFps`, `packetsDropped`, dead
+4. **B9** — return HTTP 400 (not 409) for malformed request bodies.
+5. **B8 + B11** — offload blocking moves; add bounded I²C retries.
+6. **Performance #1** — stop shipping the full grid on every poll.
+7. **Delete dead code** (§5) — `proto/`, `radarFps`, `packetsDropped`, dead
    config fields.
-10. **Add tests.** There is currently **zero test coverage** in any of the
-    three languages. At minimum: unit-test `GenerateStepTimes` (the trapezoidal
-    profile — pure, math-heavy, easy to test, and a bug there moves the motor
-    wrong), the lease state machine, and `CoordForIndex` boustrophedon logic.
+8. **Add tests.** There is currently **zero test coverage** in any of the
+   three languages. At minimum: unit-test `GenerateStepTimes` (the trapezoidal
+   profile — pure, math-heavy, easy to test, and a bug there moves the motor
+   wrong), the lease state machine, and `CoordForIndex` boustrophedon logic.

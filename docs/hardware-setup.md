@@ -113,9 +113,8 @@ This inversion ("Pi LOW = asserted") is why the config defaults are:
 | `dir_active_low` | `false` | Direction is a level, not a pulse; no inversion keeps the gantry's mechanical convention consistent |
 
 **Microstepping.** Set both drivers' S1/S2/S3 DIP switches to the same value
-and make `mechanics.microsteps` in `hardware.json` match. The TB6600 supports
-**up to 32 microsteps** in hardware — see the warning in
-[§9](#9-configuration-hardwarejson).
+and make `mechanics.microsteps` in `hardware.json` match. The default is
+**128** — see [§9](#9-configuration-hardwarejson).
 
 **Fail-safe on power loss / daemon exit.** On a clean exit `pigpio` releases
 the GPIOs; the un-driven `ENA−` line floats HIGH through the `PUL+` tie and
@@ -292,7 +291,7 @@ The `PRISM_HARDWARE_CONFIG` env var overrides the path (handy for tests).
     "yaw":   {"min_deg": -50, "max_deg": 50, "max_speed_deg_s": 18, "accel_deg_s2": 60},
     "pitch": {"min_deg": -30, "max_deg": 30, "max_speed_deg_s": 12, "accel_deg_s2": 40}
   },
-  "mechanics": {"full_steps_per_rev": 200, "microsteps": 32, "yaw_gear_ratio": 1.0, "pitch_gear_ratio": 1.0},
+  "mechanics": {"full_steps_per_rev": 200, "microsteps": 128, "yaw_gear_ratio": 1.0, "pitch_gear_ratio": 1.0},
   "gpio":     {"yaw_step": 17, "yaw_dir": 27, "pitch_step": 22, "pitch_dir": 23,
                "enable": 24, "lidar_trigger": 25, "status_led": 18,
                "step_active_low": true, "dir_active_low": false, "enable_active_low": true},
@@ -305,11 +304,11 @@ The `PRISM_HARDWARE_CONFIG` env var overrides the path (handy for tests).
 }
 ```
 
-> **⚠ `mechanics.microsteps`.** TB6600 drivers support a maximum of **32**
-> microsteps in hardware, and large moves planned at higher counts can overflow
-> the pigpio waveform buffer and fail. Use `32` and set the driver DIP switches
-> to match. The shipped `DefaultConfig()` currently uses `128` — this is a
-> known bug, tracked as **B2** in [`code-review.md`](./code-review.md).
+> **`mechanics.microsteps`.** Defaults to **128**. Set the TB6600 S1/S2/S3 DIP
+> switches to 128 to match — a mismatch makes every move travel the wrong
+> distance. Moves long enough to exceed pigpio's single-waveform limit (~12 000
+> pulses) are split into chunks and chained automatically by the daemon, so any
+> move size works at 128; see [`data-flow.md`](./data-flow.md) §7.
 
 **Microstep math.** The daemon converts degrees to step pulses with:
 
@@ -317,7 +316,7 @@ The `PRISM_HARDWARE_CONFIG` env var overrides the path (handy for tests).
 microsteps_per_deg = (full_steps_per_rev × microsteps × gear_ratio) / 360
 ```
 
-So at `200 × 32 × 1.0 / 360 ≈ 17.78` microsteps per degree.
+So at `200 × 128 × 1.0 / 360 ≈ 71.11` microsteps per degree.
 
 ### What is hot-swappable vs restart-required
 
@@ -442,7 +441,7 @@ cat /etc/cliffscanner/version                     # release tag
 | `fault host_watchdog: no host heartbeat in 1500ms` | No command/poll reached the daemon in time. See **B1** in [`code-review.md`](./code-review.md). |
 | `lidar i2c write failed: input/output error` | Missing common ground, or wrong I²C address. |
 | `lidar measurement timed out` | Decoupling cap missing, target out of range, or the `WaitForReady` timeout too tight. |
-| `waveform too large` on a big move | `microsteps` too high — use `32` (see §9). |
+| `move too large for pigpio wave memory` | A single move exceeds the chained-waveform ceiling — reduce travel distance, or check `microsteps` matches the driver DIP switches. |
 | Both services down after flash | Check `journalctl -u cliffscanner-firstboot`. |
 
 ### Why everything binds to localhost
