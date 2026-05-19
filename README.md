@@ -21,8 +21,7 @@ reads a Garmin LIDAR-Lite v3HP over I²C, and serves the operator UI.
 4. Power on. After ~90 seconds: SSH in, hit `http://<pi>:8080`, control the
    scanner.
 
-Full flash-path docs in [docs/pi-deployment.md](docs/pi-deployment.md).
-Wiring in [docs/hardware-pins.md](docs/hardware-pins.md).
+Full wiring, deployment, and bring-up: [docs/hardware-setup.md](docs/hardware-setup.md).
 
 ## Repository layout
 
@@ -38,7 +37,9 @@ Wiring in [docs/hardware-pins.md](docs/hardware-pins.md).
   GitHub Actions image-build workflow.
 - `.github/workflows/build-image.yml` — turns a tag push into a flashable
   `.img.xz` via CustoPiZer + qemu-arm64.
-- `docs` — architecture, hardware pinout, deployment notes.
+- `docs` — see the [documentation index](docs/README.md): architecture,
+  end-to-end data flow, hardware setup & deployment, the API contract, and a
+  codebase review.
 
 ## Local development (no Pi required)
 

@@ -1,90 +1,108 @@
-# Architecture Notes
+# Architecture
+
+High-level design of the Cliff Face Scanner. For the *runtime* mechanics
+(threads, request lifecycles, motion planning) see [`data-flow.md`](./data-flow.md);
+for wiring and provisioning see [`hardware-setup.md`](./hardware-setup.md).
+
+## Context & goals
+
+An automated two-axis scanner that rasters a surface (geology/surveying use
+case) with a LIDAR range sensor and presents the result as a live heatmap in a
+browser. Design constraints:
+
+- **Single Raspberry Pi 4B** — no separate microcontroller. The Pi drives the
+  stepper drivers and reads the sensor directly.
+- **One operator at a time**, lab/bench use. Safety via a control lease, a
+  host watchdog, and fail-safe driver wiring.
+- **Remote-operable** over Tailscale when the lab LAN cannot reach the device.
+- **MVP** — JSON over localhost, no message bus, no database.
 
 ## Process split
 
-The scanner runs as three processes on one Raspberry Pi 4B:
+The scanner runs as three processes on one Pi:
 
-1. **`apps/edge-daemon`** — C++ service owning all hardware. Drives steppers
-   via pigpio DMA waveforms, reads the Garmin LIDAR-Lite v3HP over I²C, and
-   exposes a localhost JSON API. This is the only process that touches GPIO.
+```mermaid
+graph LR
+  subgraph Pi["Raspberry Pi 4B"]
+    ED["edge-daemon (C++)<br/>native systemd service<br/>:9090"]
+    CA["control-api (Go)<br/>Docker container<br/>:8080"]
+    TS["tailscaled<br/>(optional)"]
+  end
+  WEB["web-ui<br/>(static files,<br/>served by control-api)"]
+  BR["Operator browser"]
+
+  BR --> TS --> CA
+  BR -. "local LAN" .-> CA
+  CA --> ED
+  CA -. serves .-> WEB
+  ED --> HW["GPIO · I²C · steppers · LIDAR"]
+```
+
+1. **`apps/edge-daemon`** — C++ service owning *all* hardware. Drives the
+   TB6600 drivers via pigpio DMA waveforms, reads the LIDAR-Lite v3HP over
+   I²C, runs the scan state machine and the safety supervisor. Exposes a
+   localhost JSON API. The only process that touches GPIO.
 2. **`apps/control-api`** — Go backend. Serves the web UI, enforces the
-   single-operator control lease, and proxies calls to the edge daemon.
-3. **`apps/web-ui`** — Static browser dashboard.
-
-Optionally, `tailscaled` on the Pi publishes the Go backend over the tailnet
-when the lab LAN can't reach the scanner directly.
-
-```
-Browser ─(HTTPS/tailnet)─► control-api (:8080) ─(HTTP/127.0.0.1)─► edge-daemon (:9090)
-                                                                         │
-                                                                         ├── pigpio DMA ── TB6600 × 2 (yaw, pitch)
-                                                                         └── I²C bus 1   ── LIDAR-Lite v3HP
-```
+   single-operator control lease, and proxies hardware calls to the edge
+   daemon. Can also run a built-in simulator with no daemon at all.
+3. **`apps/web-ui`** — static, dependency-free browser dashboard.
 
 ## Why the edge daemon exists
 
-The edge daemon centralises real-time hardware timing and fault handling so
-the web stack never has to worry about either:
+Real-time hardware timing and fault handling are concentrated in one native
+process so the web stack never has to deal with either. The edge daemon:
 
-- owns all GPIO (step/dir pulses, enable, LIDAR trigger, status LED)
-- reads LIDAR over I²C
-- runs the scan raster state machine on a dedicated worker thread
-- runs a SafetySupervisor that drops ENABLE if the host stops heart-beating
-  and that pings the systemd watchdog
-- persists the motion envelope to `/etc/prism-scanner/hardware.json`
+- owns all GPIO — step/dir pulses, the shared `ENABLE` line, the LIDAR
+  trigger, the status LED;
+- reads the LIDAR over I²C;
+- runs the scan raster on a dedicated worker thread;
+- runs a `SafetySupervisor` that drops `ENABLE` if the host stops
+  heart-beating and pings the systemd watchdog;
+- persists the motion envelope to `/etc/prism-scanner/hardware.json`.
 
-The Go backend talks to the edge daemon over localhost JSON. If the daemon
-crashes, systemd restarts it; pigpio is torn down on process exit, which
-floats the TB6600 ENABLE line and fail-safes the drivers OFF.
+If the daemon crashes, systemd restarts it; pigpio is torn down on exit, which
+floats the TB6600 `ENABLE` line and fail-safes the drivers OFF.
 
-## Scan loop
+## Key decisions & trade-offs
 
-```
-start_scan ──► ScanWorker thread ──► for each cell (boustrophedon order):
-                                        1. motion_->MoveTo(yaw, pitch)     // blocks on DMA waveform
-                                        2. gpio_->PulseTrigger(25 µs)
-                                        3. distance = lidar_->ReadDistanceMeters(...)
-                                        4. state_.grid[y][x] = normalise(distance)
-                                     on fault: SafetySupervisor::TriggerFault → AbortMotion, ENABLE off
-```
-
-Pause is cooperative (worker parks on a condition variable after the current
-cell); stop_scan and estop call `motion_->AbortMotion()` which halts the
-pigpio waveform immediately and marks axis positions as unknown (operator
-must HOME before the next move).
-
-## Motion planning
-
-Trapezoidal velocity profile per axis (see `stepper_axis.cpp`):
-
-- Compute `N_accel = min(vmax² / (2·a), N/2)` microsteps.
-- Accel phase: `t_i = √(2i/a)`.
-- Cruise phase: linear at `vmax`.
-- Decel phase: mirrored accel around the move midpoint.
-
-Yaw and pitch plan independently, then the two step-time lists are merged
-into one `WaveformPlan` so simultaneous moves run on a single pigpio DMA
-waveform. Coincident-microsecond pulses OR together into a single
-`gpioPulse_t` mask (one DMA entry, both axes stepping).
+| Decision | Rationale | Trade-off |
+|---|---|---|
+| **Pi-native, no microcontroller** | One language fewer, no serial link, no firmware/host watchdog sync. The Pi + pigpio DMA gives microsecond pulse timing without an MCU. | Linux is not real-time; relies on the DMA engine for jitter-free pulses. |
+| **Two processes (Go + C++)** | The web concern (routing, lease, static files) and the hardware concern (timing, faults) have different languages, lifecycles, and failure modes. | An extra localhost hop; two build toolchains. |
+| **edge daemon native, control-api containerised** | The Go backend is a self-contained web process — ideal for repeatable, dependency-free Docker deploys. The daemon needs direct `/dev/i2c-*` + `/dev/gpiomem` access and host-level systemd watchdog integration, which fights containerisation. | Two deployment mechanisms (systemd unit + Compose). |
+| **JSON over localhost, not gRPC** | Trivial to debug with `curl`; zero schema tooling for an MVP. | No schema enforcement; `proto/scanner/v1` exists but is unused. |
+| **Snapshot-based UI** | The server's `Snapshot` is the single source of truth; the browser is a pure renderer with no client state machine. | The full grid ships on every 700 ms poll. |
+| **Two interchangeable Go backends** | `sim` lets the whole UI run with no Pi; `edge` is the real path behind the same interface. | The sim is a parallel implementation that can drift. |
 
 ## Safety model
 
-- **Control lease** — Go API grants one operator at a time; other browsers see
-  read-only state.
-- **Host watchdog** — SafetySupervisor faults after `host_watchdog_ms` without
-  a Heartbeat() call from the HTTP layer. Any command counts as a heartbeat.
-- **Systemd watchdog** — Same thread pings `WATCHDOG=1` to `$NOTIFY_SOCKET`
-  every 100 ms; systemd `WatchdogSec=2` restarts the service if it stops.
-- **First-cause latching** — The first fault wins; later faults are swallowed
-  so the root cause isn't overwritten.
-- **Fail-safe ENABLE** — TB6600 ENABLE is wired common-anode; Pi sinks to
-  assert. Process exit → pigpio terminates → GPIO floats → driver OFF.
+- **Control lease** — the Go API grants one operator at a time (120 s sliding
+  expiry); other browsers see read-only state.
+- **Host watchdog** — `SafetySupervisor` latches a fault after
+  `host_watchdog_ms` with no `Heartbeat()` from the HTTP layer.
+- **Systemd watchdog** — the same thread pings `WATCHDOG=1` every 100 ms;
+  `WatchdogSec=2` restarts the unit if the thread stalls.
+- **First-cause latching** — the first fault wins; later faults are swallowed
+  so the root cause is not overwritten.
+- **Fail-safe ENABLE** — TB6600 `ENABLE` is wired common-anode; the Pi sinks
+  to assert. Process exit → pigpio terminates → GPIO floats → drivers OFF.
 
-## Config layering
+See [`data-flow.md`](./data-flow.md) §10 for the fault state machine.
 
-- `/etc/prism-scanner/hardware.json` — loaded at boot. Contains the motion
-  envelope, GPIO pin map, mechanics, safety timings, LIDAR I²C address, and
-  bind host/port. See `deploy/pi/hardware.json.example`.
-- Motion limits are hot-swappable via `PUT /api/config/motion` and persist
-  back to the same JSON file. Pin maps and mechanics require a restart.
-- `PRISM_HARDWARE_CONFIG` env var overrides the config path (useful in tests).
+## Configuration layering
+
+- `/etc/prism-scanner/hardware.json` — loaded at boot: motion envelope, GPIO
+  pin map, mechanics, safety timings, LIDAR I²C address, bind host/port. Seeded
+  from `deploy/pi/hardware.json.example`.
+- Motion limits are **hot-swappable** via `PUT /api/config/motion` and persist
+  back to the same file. Pin maps, mechanics, and safety timings need a
+  restart.
+- `PRISM_HARDWARE_CONFIG` overrides the config path (used in tests).
+
+Full field reference: [`hardware-setup.md`](./hardware-setup.md) §9.
+
+## Known issues
+
+This codebase has been through a vibe-coded MVP phase. A structured audit of
+correctness, error handling, performance, and dead code lives in
+[`code-review.md`](./code-review.md) — read it before extending the system.
