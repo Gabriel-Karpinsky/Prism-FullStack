@@ -39,5 +39,11 @@
     "tick_interval_ms": 20,
     "status_broadcast_interval_ms": 100
   },
+  "scan": {
+    "mode": "sweep",
+    "sweep_max_speed_deg_s": 120.0,
+    "sweep_accel_deg_s2": 800.0,
+    "lidar_period_ms": 30
+  },
   "simulate_hardware": false
 }

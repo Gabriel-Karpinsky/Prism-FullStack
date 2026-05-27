@@ -40,7 +40,20 @@ func New(baseURL string) *Client {
 
 func (c *Client) Snapshot() (scanner.Snapshot, error) {
 	var snapshot scanner.Snapshot
+	// No query string ⇒ the daemon omits the grid, keeping this refresh small.
 	if err := c.getJSON("/api/hardware/state", &snapshot); err != nil {
+		return scanner.Snapshot{}, err
+	}
+	return snapshot, nil
+}
+
+// SnapshotSince fetches state plus an incremental grid for the given cursor.
+// The since/gen query tells the daemon to ship only changed cells (or the full
+// grid when the generation is stale).
+func (c *Client) SnapshotSince(since, gen uint64) (scanner.Snapshot, error) {
+	var snapshot scanner.Snapshot
+	path := fmt.Sprintf("/api/hardware/state?since=%d&gen=%d", since, gen)
+	if err := c.getJSON(path, &snapshot); err != nil {
 		return scanner.Snapshot{}, err
 	}
 	return snapshot, nil

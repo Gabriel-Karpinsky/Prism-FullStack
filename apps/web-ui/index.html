@@ -69,6 +69,14 @@
                 </div>
 
                 <label class="field">
+                    <span>Scan mode</span>
+                    <select id="scan-mode-select">
+                        <option value="sweep">Sweep — continuous (faster)</option>
+                        <option value="step">Step — stop &amp; shoot</option>
+                    </select>
+                </label>
+
+                <label class="field">
                     <span>Scan density</span>
                     <select id="resolution-select">
                         <option value="coarse">Coarse — every 4 full steps</option>
@@ -87,7 +95,10 @@
                     <h2>Live surface map</h2>
                     <p>Synthetic height data is filled in raster order to mimic a cliff-face scan.</p>
                 </div>
-                <canvas id="surface-map" width="960" height="480"></canvas>
+                <div class="map-stack">
+                    <canvas id="surface-map" width="960" height="480"></canvas>
+                    <canvas id="surface-overlay" width="960" height="480"></canvas>
+                </div>
                 <div class="map-legend">
                     <span>Low</span>
                     <div class="legend-bar"></div>
@@ -116,14 +127,6 @@
                     <div class="telemetry-card">
                         <span>Progress</span>
                         <strong id="progress-value">0%</strong>
-                    </div>
-                    <div class="telemetry-card">
-                        <span>Motor temp</span>
-                        <strong id="motor-temp-value">0.0 C</strong>
-                    </div>
-                    <div class="telemetry-card">
-                        <span>Latency</span>
-                        <strong id="latency-value">0 ms</strong>
                     </div>
                 </div>
 

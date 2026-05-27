@@ -8,7 +8,11 @@ import (
 )
 
 type HardwareClient interface {
+	// Snapshot fetches current state without a grid (for lease decoration and
+	// command refreshes). SnapshotSince is the polled path and carries an
+	// incremental GridUpdate for the client's since/generation cursor.
 	Snapshot() (Snapshot, error)
+	SnapshotSince(since, gen uint64) (Snapshot, error)
 	Command(command string, payload map[string]any) (Snapshot, error)
 	MotionConfig() (MotionConfig, error)
 	UpdateMotionConfig(MotionConfig) (MotionConfig, error)
@@ -52,6 +56,27 @@ func (s *EdgeService) Snapshot() Snapshot {
 
 	syncErr := s.syncHardwareLocked()
 	return s.decorateSnapshotLocked(s.lastSnapshot, syncErr)
+}
+
+// SnapshotDelta is the polled path: it fetches an incremental grid for the
+// client's cursor and passes the GridUpdate straight through (decoration only
+// touches lease/activity fields). On a sync error it returns the last known
+// state with no GridUpdate so the client keeps its grid and retries next poll.
+func (s *EdgeService) SnapshotDelta(since, gen uint64) Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.clearExpiredLeaseLocked()
+	snapshot, err := s.client.SnapshotSince(since, gen)
+	if err != nil {
+		s.lastError = err.Error()
+		decorated := s.decorateSnapshotLocked(s.lastSnapshot, err)
+		decorated.GridUpdate = nil
+		return decorated
+	}
+	s.lastSnapshot = snapshot
+	s.lastError = ""
+	return s.decorateSnapshotLocked(snapshot, nil)
 }
 
 func (s *EdgeService) Acquire(user string) (Snapshot, error) {

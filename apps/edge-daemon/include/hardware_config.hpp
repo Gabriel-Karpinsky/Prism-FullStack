@@ -61,6 +61,18 @@ struct ServiceConfig {
   int status_broadcast_interval_ms;
 };
 
+// Continuous-scan parameters. In "sweep" mode the head sweeps each row at a
+// constant velocity while the LIDAR samples on the fly, instead of stopping
+// at every cell ("step" mode). The sweep velocity is capped so the head
+// advances at most ~one cell per LIDAR sample period — that is the "maximal
+// velocity the LIDAR can support" for a given density.
+struct ScanConfig {
+  std::string mode = "sweep";            // "sweep" (continuous) | "step" (stop-and-shoot)
+  double sweep_max_speed_deg_s = 120.0;  // motor cap for sweeps (light gantry → generous)
+  double sweep_accel_deg_s2 = 800.0;     // ramp rate at row ends (light gantry → aggressive)
+  int lidar_period_ms = 30;              // assumed LIDAR sample period
+};
+
 struct Config {
   MotionConfig motion;
   MechanicsConfig mechanics;
@@ -68,6 +80,7 @@ struct Config {
   SafetyConfig safety;
   LidarHardwareConfig lidar;
   ServiceConfig service;
+  ScanConfig scan;
   bool simulate_hardware;
   std::string config_file_path;
 };
