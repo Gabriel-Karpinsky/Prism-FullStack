@@ -381,6 +381,10 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
 }
 
 void EdgeDaemon::ScanWorker() {
+  if (config_.scan.mode == "sweep") {
+    ScanWorkerSweep();
+    return;
+  }
   while (true) {
     int index = 0;
     int width = 0;
@@ -456,6 +460,125 @@ void EdgeDaemon::ScanWorker() {
   }
 }
 
+void EdgeDaemon::ScanWorkerSweep() {
+  // Continuous scan: sweep yaw across each row at a constant, LIDAR-limited
+  // velocity while reading the sensor on the fly. The head only accelerates
+  // and decelerates once per row (at the ends), not once per cell — which is
+  // where stop-and-shoot scanning burns nearly all its time. Boustrophedon:
+  // even rows sweep min→max, odd rows max→min, so no inter-row repositioning.
+  const double mspd_yaw = config_.mechanics.yaw_microsteps_per_deg();
+
+  while (true) {
+    int width = 0, height = 0, row = 0;
+    double yaw_min = 0.0, yaw_max = 0.0;
+    bool forward = true;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      scan_cv_.wait(lock, [&] {
+        return scan_state_ == ScanState::Scanning || scan_state_ == ScanState::Stopping;
+      });
+      if (scan_state_ == ScanState::Stopping) return;
+
+      width  = state_.grid.empty() ? 0 : static_cast<int>(state_.grid.front().size());
+      height = static_cast<int>(state_.grid.size());
+      if (width == 0 || height == 0) {
+        scan_state_ = ScanState::Idle;
+        state_.mode = "idle";
+        return;
+      }
+      row = scan_row_;
+      if (row >= height) {
+        FinishScanLocked("Scan complete. Surface model updated.");
+        scan_state_ = ScanState::Idle;
+        return;
+      }
+      yaw_min = state_.scan_settings.yaw_min;
+      yaw_max = state_.scan_settings.yaw_max;
+      forward = (row % 2 == 0);
+    }
+
+    const double tgt_pitch = TargetPitchForCell(row, height);
+    const double yaw_start = forward ? yaw_min : yaw_max;
+    const double yaw_end   = forward ? yaw_max : yaw_min;
+
+    // 1. Position the head at the row start + correct pitch (point-to-point).
+    const auto pre = motion_->MoveTo(yaw_start, tgt_pitch);
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ == ScanState::Stopping) return;
+      if (!pre.success) {
+        FailLocked("Scan positioning failed: " + pre.error);
+        safety_->TriggerFault(FaultCode::MotionAbort, pre.error);
+        scan_state_ = ScanState::Idle;
+        return;
+      }
+      if (scan_state_ == ScanState::Paused) continue;  // row not started; re-park on CV
+    }
+
+    // 2. LIDAR-limited sweep velocity: head advances at most ~one cell per
+    //    LIDAR sample period, capped by the motor's sweep ceiling.
+    const double cell_w = (yaw_max - yaw_min) / std::max(1, width - 1);
+    const double lidar_period_s = std::max(1, config_.scan.lidar_period_ms) / 1000.0;
+    const double v_sweep = std::min(config_.scan.sweep_max_speed_deg_s, cell_w / lidar_period_s);
+
+    // 3. Launch the continuous sweep.
+    std::string err;
+    if (!motion_->StartYawSweep(yaw_end, v_sweep, config_.scan.sweep_accel_deg_s2, err)) {
+      std::scoped_lock lock(mutex_);
+      FailLocked("Sweep start failed: " + err);
+      safety_->TriggerFault(FaultCode::MotionAbort, err);
+      scan_state_ = ScanState::Idle;
+      return;
+    }
+
+    // 4. Sample on the fly, binning each reading to a cell by head position.
+    bool aborted = false;
+    const double span = std::max(1e-9, yaw_max - yaw_min);
+    while (motion_->SweepBusy()) {
+      {
+        std::scoped_lock lock(mutex_);
+        if (scan_state_ == ScanState::Stopping) aborted = true;
+      }
+      if (aborted) { motion_->AbortMotion(); break; }
+
+      const long s0 = motion_->SweepMicrostepsTravelled();
+      const double yaw_pre = forward ? (yaw_start + s0 / mspd_yaw) : (yaw_start - s0 / mspd_yaw);
+      gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
+      const double distance = lidar_->ReadDistanceMeters(yaw_pre, tgt_pitch);
+      const long s1 = motion_->SweepMicrostepsTravelled();
+      if (std::isnan(distance)) continue;  // transient bad read: skip, keep sweeping
+
+      const double trav_deg = (static_cast<double>(s0 + s1) / 2.0) / mspd_yaw;
+      const double yaw_now = forward ? (yaw_start + trav_deg) : (yaw_start - trav_deg);
+      int x = static_cast<int>(std::lround((yaw_now - yaw_min) / span * (width - 1)));
+      if (x < 0) x = 0;
+      if (x >= width) x = width - 1;
+
+      const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ == ScanState::Stopping) { aborted = true; }
+      else { state_.grid[row][x] = Round(normalised, 10000.0); }
+      if (aborted) { motion_->AbortMotion(); break; }
+    }
+
+    motion_->FinishYawSweep(!aborted);
+
+    std::scoped_lock lock(mutex_);
+    if (scan_state_ == ScanState::Stopping) return;
+    scan_row_ = row + 1;
+    filled_cells_ = scan_row_ * width;  // rows completed (per-cell gaps are cosmetic)
+    const int total = width * height;
+    state_.coverage = Round(static_cast<double>(filled_cells_) / std::max(1, total), 10000.0);
+    state_.scan_progress = state_.coverage;
+    UpdateMetricsLocked();
+    if (scan_row_ >= height) {
+      FinishScanLocked("Scan complete. Surface model updated.");
+      scan_state_ = ScanState::Idle;
+      return;
+    }
+  }
+}
+
 std::pair<int, int> EdgeDaemon::CoordForIndex(int index, int width) const {
   int row = width > 0 ? index / width : 0;
   int col = width > 0 ? index % width : 0;
@@ -517,9 +640,19 @@ void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
   state_.grid.assign(static_cast<std::size_t>(height),
                      std::vector<double>(static_cast<std::size_t>(width), -1.0));
 
-  const double per_point_ms = 110.0;  // rough budget: move + settle + trigger + read
-  state_.scan_duration_seconds =
-      Round((static_cast<double>(width) * static_cast<double>(height) * per_point_ms) / 1000.0, 100.0);
+  double duration_s;
+  if (config_.scan.mode == "sweep") {
+    // Continuous: per-row time ≈ sweep duration + a fixed ramp/pitch-step budget.
+    const double cell_w = yaw_span / static_cast<double>(std::max(1L, width - 1));
+    const double lidar_period_s = std::max(1, config_.scan.lidar_period_ms) / 1000.0;
+    const double v = std::min(config_.scan.sweep_max_speed_deg_s, cell_w / lidar_period_s);
+    const double row_s = (v > 0.0 ? yaw_span / v : 0.0) + 0.4;
+    duration_s = row_s * static_cast<double>(height);
+  } else {
+    const double per_point_ms = 110.0;  // move + settle + trigger + read
+    duration_s = (static_cast<double>(width) * static_cast<double>(height) * per_point_ms) / 1000.0;
+  }
+  state_.scan_duration_seconds = Round(duration_s, 100.0);
   ResetScanLocked();
 }
 
@@ -530,6 +663,7 @@ void EdgeDaemon::ResetScanLocked() {
   state_.last_completed_scan_at.reset();
   filled_cells_ = 0;
   scan_index_ = 0;
+  scan_row_ = 0;
 }
 
 void EdgeDaemon::AddLogLocked(const std::string& source, const std::string& level,

@@ -1,7 +1,9 @@
 #include "motion_controller.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <iterator>
 #include <mutex>
 #include <vector>
 
@@ -116,6 +118,72 @@ MotionController::MoveResult MotionController::Home() {
   // No endstops: "home" is a soft zero — move to (0,0) and trust the axis state.
   // The operator is expected to have hand-zeroed the gantry before service start.
   return MoveTo(0.0, 0.0);
+}
+
+bool MotionController::StartYawSweep(double yaw_target_deg, double speed_deg_s,
+                                    double accel_deg_s2, std::string& error) {
+  std::unique_lock<std::mutex> lock(mutex_);
+  if (busy_.load()) {
+    error = "motion already in flight";
+    return false;
+  }
+
+  auto plan = yaw_.PlanMove(yaw_target_deg, speed_deg_s, accel_deg_s2);
+  if (plan.steps == 0) {
+    sweep_active_ = false;  // already at target; caller's SweepBusy() will be false
+    return true;
+  }
+
+  gpio_.SetAxisDirection(AxisId::Yaw, plan.forward);
+  if (!enabled_.load()) {
+    gpio_.SetEnabled(true);
+    enabled_.store(true);
+  }
+
+  // Yaw-only waveform (empty pitch plan ⇒ pitch holds position during the sweep).
+  WaveformPlan wave = MergeAxisPlans(plan, StepperAxis::MovePlan{});
+
+  sweep_plan_ = plan;
+  sweep_active_ = true;
+  busy_.store(true);
+  lock.unlock();
+
+  if (!gpio_.StartMotionWaveform(wave, error)) {
+    lock.lock();
+    busy_.store(false);
+    sweep_active_ = false;
+    return false;
+  }
+  sweep_start_time_ = std::chrono::steady_clock::now();
+  return true;
+}
+
+bool MotionController::SweepBusy() const { return gpio_.IsMotionBusy(); }
+
+long MotionController::SweepMicrostepsTravelled() const {
+  if (!sweep_active_) return 0;
+  const auto elapsed = std::chrono::steady_clock::now() - sweep_start_time_;
+  const auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+  const auto& t = sweep_plan_.step_times_us;
+  if (t.empty() || us <= 0) return 0;
+  const std::uint32_t key = static_cast<std::uint32_t>(us);
+  auto it = std::upper_bound(t.begin(), t.end(), key);
+  long travelled = static_cast<long>(std::distance(t.begin(), it));
+  return std::min(travelled, static_cast<long>(sweep_plan_.steps));
+}
+
+void MotionController::FinishYawSweep(bool reached_target) {
+  gpio_.FinishMotionWaveform();
+  std::unique_lock<std::mutex> lock(mutex_);
+  busy_.store(false);
+  if (sweep_active_) {
+    if (reached_target) {
+      yaw_.Commit(sweep_plan_);
+    } else {
+      yaw_.MarkPositionUnknown();  // open-loop position no longer trusted; re-home
+    }
+    sweep_active_ = false;
+  }
 }
 
 double MotionController::yaw_deg() const {

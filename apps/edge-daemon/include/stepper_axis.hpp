@@ -27,7 +27,9 @@ class StepperAxis {
   double target_deg() const { return last_target_deg_; }
 
   // Trapezoidal-profile plan from current position to (clamped) target.
-  MovePlan PlanMove(double target_deg) const;
+  // speed_deg_s / accel_deg_s2 of 0 mean "use this axis's motion envelope";
+  // pass overrides to plan a faster continuous sweep.
+  MovePlan PlanMove(double target_deg, double speed_deg_s = 0.0, double accel_deg_s2 = 0.0) const;
 
   // Applied once the waveform executed successfully.
   void Commit(const MovePlan& plan);

@@ -76,7 +76,8 @@ double StepperAxis::current_deg() const {
   return MicrostepsToDeg(current_microsteps_, microsteps_per_deg_);
 }
 
-StepperAxis::MovePlan StepperAxis::PlanMove(double target_deg) const {
+StepperAxis::MovePlan StepperAxis::PlanMove(double target_deg, double speed_deg_s,
+                                            double accel_deg_s2) const {
   MovePlan plan;
   const double clamped = Clamp(target_deg, motion_.min_deg, motion_.max_deg);
   plan.final_deg = clamped;
@@ -88,8 +89,10 @@ StepperAxis::MovePlan StepperAxis::PlanMove(double target_deg) const {
   plan.forward = delta > 0;
   plan.steps = static_cast<int>(std::llabs(delta));
 
-  const double accel_steps = motion_.accel_deg_s2 * microsteps_per_deg_;
-  const double vmax_steps = motion_.max_speed_deg_s * microsteps_per_deg_;
+  const double accel = accel_deg_s2 > 0.0 ? accel_deg_s2 : motion_.accel_deg_s2;
+  const double vmax  = speed_deg_s  > 0.0 ? speed_deg_s  : motion_.max_speed_deg_s;
+  const double accel_steps = accel * microsteps_per_deg_;
+  const double vmax_steps = vmax * microsteps_per_deg_;
   plan.step_times_us = GenerateStepTimes(plan.steps, accel_steps, vmax_steps);
   plan.total_duration_us = plan.step_times_us.empty() ? 0u : plan.step_times_us.back();
   return plan;

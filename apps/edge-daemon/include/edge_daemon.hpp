@@ -49,7 +49,8 @@ class EdgeDaemon {
   void FinishScanLocked(const std::string& message);
   void FailLocked(const std::string& message);
 
-  void ScanWorker();
+  void ScanWorker();        // dispatches to step or sweep loop by config_.scan.mode
+  void ScanWorkerSweep();   // continuous: sweep each row while sampling on the fly
   std::pair<int, int> CoordForIndex(int index, int width) const;
   double TargetYawForCell(int x, int width) const;
   double TargetPitchForCell(int y, int height) const;
@@ -67,7 +68,8 @@ class EdgeDaemon {
   std::condition_variable scan_cv_;
   std::thread scan_worker_;
   ScanState scan_state_ = ScanState::Idle;
-  int scan_index_ = 0;
+  int scan_index_ = 0;   // cell cursor (step mode)
+  int scan_row_ = 0;     // row cursor (sweep mode)
   int filled_cells_ = 0;
 };
 

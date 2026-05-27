@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <pigpio.h>
@@ -103,11 +104,22 @@ class PigpioGpioBackend final : public IGpioBackend {
   }
 
   bool RunMotionWaveform(const WaveformPlan& plan, std::string& error) override {
+    if (!StartMotionWaveform(plan, error)) return false;
+    FinishMotionWaveform();
+    return true;
+  }
+
+  // Launch the waveform without waiting. Used directly by continuous sweeps;
+  // RunMotionWaveform wraps Start + Finish for blocking point-to-point moves.
+  bool StartMotionWaveform(const WaveformPlan& plan, std::string& error) override {
     if (!initialized_) { error = "backend not initialized"; return false; }
-    if (plan.pulses.empty()) return true;
 
     std::lock_guard<std::mutex> lock(motion_mutex_);
+    for (int id : active_wave_ids_) gpioWaveDelete(id);  // reap any stragglers
+    active_wave_ids_.clear();
     abort_requested_.store(false);
+    busy_.store(false);
+    if (plan.pulses.empty()) return true;
 
     SetAxisDirection(AxisId::Yaw,   plan.yaw_forward);
     SetAxisDirection(AxisId::Pitch, plan.pitch_forward);
@@ -118,12 +130,12 @@ class PigpioGpioBackend final : public IGpioBackend {
 
     auto pulses = EventsToPigpioPulses(events);
 
-    // pigpio caps a single waveform at ~12000 pulses. A long move (e.g. a
-    // full-travel seek at 128 microsteps) is split into chunks of
-    // kWaveMaxPulses; gpioWaveChain then transmits them seamlessly so the
-    // motor still sees one continuous trapezoidal profile with no mid-move
-    // pause. usDelay was computed from the absolute event timeline, so the
-    // delay at a chunk boundary already carries the gap to the next chunk.
+    // pigpio caps a single waveform at ~12000 pulses. A long move (a full-travel
+    // seek, or a whole continuous-scan row) is split into chunks of
+    // kWaveMaxPulses; gpioWaveChain then transmits them seamlessly so the motor
+    // sees one continuous trapezoidal profile with no mid-move pause. usDelay
+    // was computed from the absolute event timeline, so the delay at a chunk
+    // boundary already carries the gap to the next chunk.
     gpioWaveClear();
     std::vector<int> wave_ids;
     for (std::size_t off = 0; off < pulses.size(); off += kWaveMaxPulses) {
@@ -157,7 +169,14 @@ class PigpioGpioBackend final : public IGpioBackend {
       error = "gpioWaveChain failed";
       return false;
     }
+    active_wave_ids_ = std::move(wave_ids);
+    return true;
+  }
 
+  // Wait for the active waveform to drain (respecting aborts) and release the
+  // DMA wave buffers. Safe to call when nothing is in flight.
+  void FinishMotionWaveform() override {
+    std::lock_guard<std::mutex> lock(motion_mutex_);
     while (gpioWaveTxBusy()) {
       if (abort_requested_.load()) {
         gpioWaveTxStop();
@@ -165,12 +184,14 @@ class PigpioGpioBackend final : public IGpioBackend {
       }
       std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
+    for (int id : active_wave_ids_) gpioWaveDelete(id);
+    active_wave_ids_.clear();
     busy_.store(false);
-    for (int id : wave_ids) gpioWaveDelete(id);
-    return true;
   }
 
-  bool IsMotionBusy() const override { return busy_.load(); }
+  // Reflects the real DMA transmitter so a sweep's sampling loop can detect
+  // completion (busy_ alone would stay set until FinishMotionWaveform).
+  bool IsMotionBusy() const override { return initialized_ && gpioWaveTxBusy() != 0; }
 
   void AbortMotion() override {
     if (!initialized_) return;
@@ -268,6 +289,7 @@ class PigpioGpioBackend final : public IGpioBackend {
   std::mutex motion_mutex_;
   std::atomic<bool> busy_{false};
   std::atomic<bool> abort_requested_{false};
+  std::vector<int> active_wave_ids_;  // waves queued by StartMotionWaveform, freed by Finish
 };
 
 }  // namespace
