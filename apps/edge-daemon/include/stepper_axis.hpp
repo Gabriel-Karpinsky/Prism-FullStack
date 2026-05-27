@@ -38,6 +38,16 @@ class StepperAxis {
   void MarkPositionUnknown() { position_known_ = false; }
   bool position_known() const { return position_known_; }
 
+  // Re-establish a known datum without motion. With no endstops, the only way
+  // to recover after position tracking is lost is for the operator to hand-zero
+  // the gantry and then declare the current physical pose as zero. Restores
+  // tracking so moves are permitted again (B6 recovery path).
+  void ResetToZero() {
+    current_microsteps_ = 0;
+    last_target_deg_ = 0.0;
+    position_known_ = true;
+  }
+
   AxisId id() const { return id_; }
   double microsteps_per_deg() const { return microsteps_per_deg_; }
 

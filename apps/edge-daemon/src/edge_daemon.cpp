@@ -287,6 +287,13 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
         error_message = "Stop the current scan before jogging.";
         return state_;
       }
+      // B6: refuse to jog from an untrusted position (an aborted move left
+      // tracking stale). Friendly message + no fault latch — the operator just
+      // needs to re-home to re-establish the datum.
+      if (!motion_->yaw_position_known() || !motion_->pitch_position_known()) {
+        error_message = "Position unknown after an aborted move. Home the gantry before jogging.";
+        return state_;
+      }
       target_yaw   = motion_->yaw_deg();
       target_pitch = motion_->pitch_deg();
       if (request.axis == "yaw") target_yaw   += request.delta;
@@ -311,6 +318,12 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
       std::scoped_lock lock(mutex_);
       if (scan_state_ != ScanState::Idle) {
         error_message = "Stop the current scan before starting a new one.";
+        return state_;
+      }
+      // B6: a scan is a long sequence of planned moves; refuse to start one from
+      // an untrusted position. The operator must re-home first.
+      if (!motion_->yaw_position_known() || !motion_->pitch_position_known()) {
+        error_message = "Position unknown after an aborted move. Home the gantry before scanning.";
         return state_;
       }
       // scan_state_ == Idle implies the worker (if any) has already exited;

@@ -197,8 +197,14 @@ int HttpServer::Run() {
       ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
+    // Control payloads are tiny (a command object, a motion-config block). Cap
+    // the total request we'll buffer so a client can't drive the daemon to OOM
+    // (B5): either by advertising a huge Content-Length or by streaming forever.
+    constexpr std::size_t kMaxRequestBytes = 1u << 20;  // 1 MiB
+
     std::string raw;
     char buffer[4096];
+    bool reject_too_large = false;
     while (!shutdown_.load()) {
       const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer), 0);
       if (n < 0) {
@@ -207,14 +213,36 @@ int HttpServer::Run() {
       }
       if (n == 0) break;  // client closed cleanly
       raw.append(buffer, static_cast<std::size_t>(n));
+      if (raw.size() > kMaxRequestBytes) { reject_too_large = true; break; }  // B5: bound bytes received
       const auto hend = raw.find("\r\n\r\n");
       if (hend == std::string::npos) continue;
       std::smatch m;
       std::regex cl_re("Content-Length:\\s*([0-9]+)", std::regex_constants::icase);
       std::size_t expected = 0;
       const std::string headers = raw.substr(0, hend);
-      if (std::regex_search(headers, m, cl_re)) expected = std::stoul(m[1].str());
+      if (std::regex_search(headers, m, cl_re)) {
+        // B4: a malformed or oversized Content-Length must not throw out of the
+        // recv loop. std::stoul on a value past ULONG_MAX throws std::out_of_range,
+        // and this runs *before* the request-handling try block below — an uncaught
+        // throw here would call std::terminate and kill the daemon. Any client on
+        // the tailnet could trigger it with one crafted header. Parse defensively.
+        try {
+          expected = static_cast<std::size_t>(std::stoull(m[1].str()));
+        } catch (const std::exception&) {
+          reject_too_large = true;  // unparseable length: refuse rather than crash
+          break;
+        }
+        if (expected > kMaxRequestBytes) { reject_too_large = true; break; }  // B5
+      }
       if (raw.size() >= hend + 4 + expected) break;
+    }
+
+    if (reject_too_large) {
+      const std::string response = MakeResponse(
+          413, "Payload Too Large", json{{"error", "request too large"}}.dump());
+      ::send(client_fd, response.data(), response.size(), MSG_NOSIGNAL);
+      ::close(client_fd);
+      continue;
     }
 
     const Request req = ParseRequest(raw);

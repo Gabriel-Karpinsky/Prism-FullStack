@@ -73,6 +73,18 @@ MotionController::MoveResult MotionController::MoveTo(double yaw_deg, double pit
     return result;
   }
 
+  // B6: after an aborted waveform the motor moved partway but current_microsteps_
+  // was never updated, so the tracked position is wrong. Refuse to plan from a
+  // stale position — a move would silently drive to the wrong place. The operator
+  // must re-home (Home() below re-establishes a datum) before any further move.
+  if (!yaw_.position_known() || !pitch_.position_known()) {
+    result.success = false;
+    result.error = "position unknown after an aborted move; re-home before moving";
+    result.yaw_deg = yaw_.current_deg();
+    result.pitch_deg = pitch_.current_deg();
+    return result;
+  }
+
   const auto yaw_plan = yaw_.PlanMove(yaw_deg);
   const auto pitch_plan = pitch_.PlanMove(pitch_deg);
 
@@ -115,8 +127,25 @@ MotionController::MoveResult MotionController::MoveTo(double yaw_deg, double pit
 }
 
 MotionController::MoveResult MotionController::Home() {
-  // No endstops: "home" is a soft zero — move to (0,0) and trust the axis state.
-  // The operator is expected to have hand-zeroed the gantry before service start.
+  // No endstops: "home" is a soft zero. Two cases:
+  //   • Position known  → drive a normal trapezoidal move back to (0,0).
+  //   • Position unknown → tracking was lost to an aborted move, so current
+  //     position is stale and a computed move would go somewhere arbitrary.
+  //     This is the B6 recovery path: the operator hand-zeroes the gantry and
+  //     Home re-establishes the datum by declaring the current pose as (0,0),
+  //     restoring tracking *without* commanding bogus motion.
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!yaw_.position_known() || !pitch_.position_known()) {
+      yaw_.ResetToZero();
+      pitch_.ResetToZero();
+      MoveResult result;
+      result.success = true;
+      result.yaw_deg = yaw_.current_deg();
+      result.pitch_deg = pitch_.current_deg();
+      return result;
+    }
+  }  // release lock before MoveTo (mutex_ is non-recursive)
   return MoveTo(0.0, 0.0);
 }
 
