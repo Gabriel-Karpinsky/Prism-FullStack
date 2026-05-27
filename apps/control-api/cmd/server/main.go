@@ -227,7 +227,9 @@ func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
-	payload, err := json.MarshalIndent(body, "", "  ")
+	// Compact JSON: every response is machine-read (the UI or the edge client),
+	// and the grid payloads can be large — pretty-printing wastes bytes and CPU.
+	payload, err := json.Marshal(body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return

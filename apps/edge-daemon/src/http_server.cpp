@@ -119,14 +119,8 @@ json SnapshotToJson(const Snapshot& s) {
           {"resolution",            s.scan_settings.resolution},
           {"sampleStrideMicrosteps", s.scan_settings.sample_stride_microsteps},
       }},
-      {"metrics", {
-          {"motorTempC",     s.metrics.motor_temp_c},
-          {"motorCurrentA",  s.metrics.motor_current_a},
-          {"lidarFps",       s.metrics.lidar_fps},
-          {"radarFps",       s.metrics.radar_fps},
-          {"latencyMs",      s.metrics.latency_ms},
-          {"packetsDropped", s.metrics.packets_dropped},
-      }},
+      // Telemetry placeholder — the fabricated motor/lidar metrics were removed.
+      {"metrics", json::object()},
       {"faults", s.faults},
       {"activity", activity},
   };

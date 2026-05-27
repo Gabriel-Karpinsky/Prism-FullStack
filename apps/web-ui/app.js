@@ -28,8 +28,6 @@ const el = {
   pitchValue: document.getElementById("pitch-value"),
   coverageValue: document.getElementById("coverage-value"),
   progressValue: document.getElementById("progress-value"),
-  motorTempValue: document.getElementById("motor-temp-value"),
-  latencyValue: document.getElementById("latency-value"),
   progressFill: document.getElementById("progress-fill"),
   scanDurationValue: document.getElementById("scan-duration-value"),
   resolutionDetail: document.getElementById("resolution-detail"),
@@ -249,8 +247,6 @@ function renderState(snapshot) {
   el.pitchValue.textContent = `${snapshot.pitch.toFixed(1)}°`;
   el.coverageValue.textContent = `${Math.round(snapshot.coverage * 100)}%`;
   el.progressValue.textContent = `${Math.round(snapshot.scanProgress * 100)}%`;
-  el.motorTempValue.textContent = `${snapshot.metrics.motorTempC.toFixed(1)} C`;
-  el.latencyValue.textContent = `${snapshot.metrics.latencyMs} ms`;
   el.progressFill.style.width = `${Math.round(snapshot.scanProgress * 100)}%`;
   el.scanDurationValue.textContent = `Estimated duration: ${formatDuration(snapshot.scanDurationSeconds)}`;
   el.resolutionSelect.value = snapshot.scanSettings.resolution;

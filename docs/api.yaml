@@ -104,14 +104,48 @@ components:
 
     Metrics:
       type: object
+      description: |
+        Placeholder for future real sensor telemetry. Previously carried
+        fabricated motor temp/current, lidar/radar fps and latency values shown
+        as if measured; those were removed. Currently always an empty object.
+      properties: {}
+
+    GridUpdate:
+      type: object
+      description: |
+        Incremental scan-grid update. The client holds the grid locally and
+        applies deltas. `idx`/`val` are parallel arrays: `idx` is the row-major
+        cell index (y*width + x), `val` the normalised height in [0, 1]. `full`
+        is true when the client must rebuild (its `generation` was stale — e.g.
+        after a resolution change or scan reset). Only present on `/api/state`
+        responses that include a `?since=` query.
       properties:
-        motorTempC:
-          type: number
-          format: double
-          description: Estimated motor temperature (°C) — currently placeholder.
-        latencyMs:
+        generation:
           type: integer
-          description: Round-trip latency between control-api and edge daemon (ms).
+          format: int64
+          description: Grid identity; changes on resize/reset.
+        version:
+          type: integer
+          format: int64
+          description: Monotonic change counter (resets on generation bump).
+        width:
+          type: integer
+        height:
+          type: integer
+        full:
+          type: boolean
+          description: True ⇒ rebuild the local grid from idx/val.
+        idx:
+          type: array
+          items:
+            type: integer
+          description: Changed cell indices (row-major, y*width + x).
+        val:
+          type: array
+          items:
+            type: number
+            format: double
+          description: Normalised heights [0, 1], parallel to idx.
 
     ActivityEntry:
       type: object
@@ -176,16 +210,15 @@ components:
           items:
             $ref: "#/components/schemas/ActivityEntry"
           description: Recent log entries, newest first.
-        grid:
-          type: array
-          items:
-            type: array
-            items:
-              type: number
-              format: double
+        gridUpdate:
+          allOf:
+            - $ref: "#/components/schemas/GridUpdate"
+          nullable: true
           description: |
-            2-D height-map grid. Each cell is a normalised value in [0, 1]
-            (or -1 if not yet measured). Row 0 is the lowest pitch row.
+            Incremental scan-grid delta. Present only on polled `/api/state`
+            requests that send a `?since=<version>&gen=<generation>` cursor;
+            omitted on command/lease responses. The full grid is no longer
+            shipped inline — the client reconstructs it from these deltas.
 
     ErrorResponse:
       type: object

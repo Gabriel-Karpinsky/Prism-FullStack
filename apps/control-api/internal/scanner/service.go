@@ -66,14 +66,6 @@ func NewService() *Service {
 				SweepSpeedDegPerSec: 20,
 				Resolution:          "standard",
 			},
-			metrics: Metrics{
-				MotorTempC:     31.4,
-				MotorCurrentA:  1.3,
-				LidarFPS:       18,
-				RadarFPS:       11,
-				LatencyMS:      42,
-				PacketsDropped: 0,
-			},
 			faults:   []string{},
 			activity: []ActivityEntry{},
 			motionConfig: MotionConfig{
@@ -427,8 +419,6 @@ func (s *Service) updateLocked() {
 			s.state.scanProgress = round4(clamp(s.state.scanAccumulated/s.state.scanDurationSeconds, 0, 1))
 		}
 	}
-
-	s.updateMetricsLocked()
 }
 
 func (s *Service) snapshotLocked() Snapshot {
@@ -532,20 +522,6 @@ func (s *Service) setHeadLocked(index int) {
 
 	s.state.yaw = round2(s.state.scanSettings.YawMin + (float64(x)/float64(max(1, s.state.gridW-1)))*yawRange)
 	s.state.pitch = round2(s.state.scanSettings.PitchMin + (float64(y)/float64(max(1, s.state.gridH-1)))*pitchRange)
-}
-
-func (s *Service) updateMetricsLocked() {
-	phase := float64(time.Now().UTC().UnixMilli()) / 1000.0
-	scanLoad := 0.0
-	if s.state.mode == "scanning" {
-		scanLoad = 1.0
-	}
-
-	s.state.metrics.MotorTempC = round1(31.0 + (math.Sin(phase*0.35) * 1.8) + (scanLoad * 3.0))
-	s.state.metrics.MotorCurrentA = round2(1.2 + (scanLoad * 0.45) + ((1.0 - scanLoad) * 0.08) + (math.Cos(phase*0.52) * 0.08))
-	s.state.metrics.LidarFPS = int(math.Round(18 + (scanLoad * 6.0) + (math.Sin(phase) * 1.5)))
-	s.state.metrics.RadarFPS = int(math.Round(11 + (scanLoad * 4.0) + (math.Cos(phase*0.7) * 1.2)))
-	s.state.metrics.LatencyMS = int(math.Round(36 + (scanLoad * 14.0) + ((1.0 - scanLoad) * 4.0) + (math.Abs(math.Sin(phase*0.45)) * 8)))
 }
 
 func newGrid(w, h int) [][]float64 {
@@ -655,7 +631,6 @@ func clamp(value, minValue, maxValue float64) float64 {
 	return value
 }
 
-func round1(v float64) float64 { return math.Round(v*10) / 10 }
 func round2(v float64) float64 { return math.Round(v*100) / 100 }
 func round4(v float64) float64 { return math.Round(v*10000) / 10000 }
 

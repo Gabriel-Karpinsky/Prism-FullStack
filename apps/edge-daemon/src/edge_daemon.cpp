@@ -518,7 +518,6 @@ void EdgeDaemon::ScanWorker() {
     const int total = width * height;
     state_.coverage = Round(static_cast<double>(filled_cells_) / std::max(1, total), 10000.0);
     state_.scan_progress = state_.coverage;
-    UpdateMetricsLocked();
 
     if (scan_index_ >= total) {
       FinishScanLocked("Scan complete. Surface model updated.");
@@ -638,7 +637,6 @@ void EdgeDaemon::ScanWorkerSweep() {
     const int total = width * height;
     state_.coverage = Round(static_cast<double>(filled_cells_) / std::max(1, total), 10000.0);
     state_.scan_progress = state_.coverage;
-    UpdateMetricsLocked();
     if (scan_row_ >= height) {
       FinishScanLocked("Scan complete. Surface model updated.");
       scan_state_ = ScanState::Idle;
@@ -788,16 +786,6 @@ void EdgeDaemon::AddLogLocked(const std::string& source, const std::string& leve
   state_.activity.insert(state_.activity.begin(),
                          ActivityEntry{source, CurrentTimestamp(), message, level});
   if (state_.activity.size() > 20) state_.activity.resize(20);
-}
-
-void EdgeDaemon::UpdateMetricsLocked() {
-  const bool scanning = state_.mode == "scanning";
-  const bool moving   = motion_->is_busy();
-  state_.metrics.motor_temp_c   = Round(31.0 + (scanning ? 4.0 : 0.8) + (moving ? 1.2 : 0.0), 10.0);
-  state_.metrics.motor_current_a = Round(moving ? 1.45 : 0.42, 100.0);
-  state_.metrics.lidar_fps      = scanning ? 12 : 0;
-  state_.metrics.radar_fps      = 0;
-  state_.metrics.latency_ms     = scanning ? 80 : 30;
 }
 
 void EdgeDaemon::FinishScanLocked(const std::string& message) {

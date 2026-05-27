@@ -17,14 +17,11 @@ type ScanSettings struct {
 	SampleStrideMicrosteps int     `json:"sampleStrideMicrosteps"`
 }
 
-type Metrics struct {
-	MotorTempC     float64 `json:"motorTempC"`
-	MotorCurrentA  float64 `json:"motorCurrentA"`
-	LidarFPS       int     `json:"lidarFps"`
-	RadarFPS       int     `json:"radarFps"`
-	LatencyMS      int     `json:"latencyMs"`
-	PacketsDropped int     `json:"packetsDropped"`
-}
+// Metrics is a placeholder for future real sensor telemetry. The fields that
+// used to live here (motor temp/current, lidar/radar fps, latency, packets
+// dropped) were fabricated values shown as if measured, and have been removed.
+// Kept as an empty struct so the wire schema can grow without another break.
+type Metrics struct{}
 
 // AxisMotion mirrors the edge-daemon's per-axis motion envelope. Keys are
 // snake_case to match the wire format the daemon ships on /api/config/motion.

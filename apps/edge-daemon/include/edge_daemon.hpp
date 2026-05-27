@@ -54,7 +54,6 @@ class EdgeDaemon {
   void ApplyResolutionLocked(const std::string& resolution);
   void ResetScanLocked();
   void AddLogLocked(const std::string& source, const std::string& level, const std::string& message);
-  void UpdateMetricsLocked();
   void FinishScanLocked(const std::string& message);
   void FailLocked(const std::string& message);
 

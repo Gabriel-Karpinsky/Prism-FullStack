@@ -27,14 +27,12 @@ struct ScanSettings {
   int sample_stride_microsteps = 0;
 };
 
-struct Metrics {
-  double motor_temp_c = 31.0;
-  double motor_current_a = 1.2;
-  int lidar_fps = 18;
-  int radar_fps = 0;
-  int latency_ms = 40;
-  int packets_dropped = 0;
-};
+// Placeholder for future real sensor telemetry (e.g. measured motor current,
+// driver temperature, LIDAR sample rate). The fields that used to live here
+// were fabricated numbers the UI displayed as if they were sensor readings;
+// they've been removed. Kept as an empty struct so the wire schema has a slot
+// to grow into without another breaking change.
+struct Metrics {};
 
 struct Snapshot {
   bool connected = true;
