@@ -98,53 +98,50 @@ On the **`continous_scan`** branch (NOT yet merged — needs bench validation at
   build and a cautious first run (start with low `sweep_max_speed_deg_s`/`sweep_accel_deg_s2`).
 - Note: this branch makes `IGpioBackend::IsMotionBusy()` **load-bearing** (the sweep loop
   polls it). Do not "remove as dead" once merged.
+- **Bug fixes (2026-05-28):** B4 (Content-Length crash), B5 (request-body cap + Go server
+  timeouts), B6 (`position_known` now blocks moves; `home` re-zeros), B8 (`home`/`jog` run
+  on an async move worker), B9 (400 vs 409), B11 (3× LIDAR read retry in step mode). B10
+  (auth) deferred by decision.
+- **Online-rendering rework (2026-05-28):** incremental grid (`/api/state?since=&gen=` →
+  `gridUpdate` deltas; grid held client-side as a `Float32Array`; dirty-cell redraw +
+  marker overlay canvas); fabricated telemetry removed (`Metrics` is now an empty
+  placeholder; `radarFps`/`packetsDropped` gone); `json.Marshal` instead of `MarshalIndent`;
+  sweep/step toggle in the UI via a new `set_scan_mode` command.
+- All validated via WSL mock builds + `go build`/`vet` + runtime mock smokes. **Still
+  needs a real-Pi `HAS_PIGPIO=1` build and a browser run before merge.** See
+  `docs/code-review.md` §7–§8 for the full status and review findings.
 
 ## Future direction / backlog
 
 Priority order. Sourced from `docs/code-review.md` and the operator's notes.
 
-### Remaining correctness/safety bugs
-- **B4** — guard the `Content-Length` parse in `http_server.cpp` (an unparseable/huge
-  value throws *before* the `try` block → uncaught → daemon dies). Wrap + clamp.
-- **B5** — cap request body size in the daemon; add `ReadTimeout`/`WriteTimeout`/
-  `ReadHeaderTimeout` to the Go `http.Server` (currently slowloris-open).
-- **B6** — make `position_known` load-bearing: after an aborted move/sweep, refuse
-  further moves until the operator re-homes (today it's recorded but never checked).
-- **B8** — get `home`/`jog` off the daemon's single HTTP thread (return "moving" + poll,
-  like `start_scan`, or add a small thread pool). Long moves currently block all polling.
-- **B9** — return HTTP **400** (not 409) for malformed request bodies; reserve 409 for
-  lease conflicts.
+### Correctness/safety bugs
+Done on `continous_scan` (pending merge): ~~B4~~, ~~B5~~, ~~B6~~, ~~B8~~, ~~B9~~, ~~B11~~.
+Still open:
 - **B10** — decide on auth: the lease is just a username string with no token. Either add
-  a token or make "tailnet-only" an explicit, documented decision.
-- **B11** — bounded retry (e.g. 3×) on transient I²C errors before latching `LidarFault`;
-  one noisy read shouldn't discard a whole scan.
+  a token or make "tailnet-only" an explicit, documented decision. **Deferred by decision.**
+- **Follow-ups from the 2026-05-28 review** (all 🟢 low, see `code-review.md` §8): the
+  daemon's whole-request timeout is still just the 1 s `SO_RCVTIMEO` loop, not a hard
+  deadline; extend the transient-vs-terminal retry (B11) to single failed moves + the I²C
+  register helpers; structured logging is still unbuilt (`EdgeService.lastError` set,
+  never read).
 
-### Web UI rework (do as one coherent effort; **fold continuous-scan into the UI here**)
-The full-grid-on-every-poll model breaks down now that grids can be huge (fine/max
-density) and `sweep` fills cells continuously.
-- **Incremental grid** (biggest win): stop shipping the whole grid each poll. Add a grid
-  generation/version counter on the daemon; client sends `?since=N` and gets only changed
-  cells (or `{unchanged:true}`). Required for large grids + continuous fill.
-- **Client framework**: keep it dependency-light. Recommended: a thin reactive layer
-  (`lit` web components, or `preact` + signals) — or hand-rolled. For minimal compute,
-  hold the grid client-side as a flat `Float32Array`, apply deltas, and **redraw only
-  dirty cells** on the canvas. Consider **SSE** to push snapshots instead of 700 ms
-  polling, but only after the incremental endpoint exists.
-- Add a **sweep/step scan-mode toggle** to the UI (and surface sweep velocity/density).
-- **Remove mock telemetry**: strip the fabricated motor temp/current/fps/latency from the
-  daemon and UI; leave a minimal/empty telemetry struct as a placeholder for real sensor
-  readings later. (Ties to the dead-code item below.)
-- Drop `json.MarshalIndent` → `json.Marshal` (pretty-print only on a debug endpoint).
+### Web UI rework — **DONE on `continous_scan`** (pending merge)
+Folded continuous-scan into the UI as one effort:
+- ~~Incremental grid~~ — done: `/api/state?since=&gen=` → compact `gridUpdate` deltas; grid
+  held client-side as a flat `Float32Array`; dirty-cell redraw + marker overlay canvas.
+  Server-side find is still O(W×H) per poll (no dirty-set) — fine under the 300k clamp.
+- ~~sweep/step toggle~~, ~~remove mock telemetry~~, ~~`json.Marshal`~~ — all done.
+- Kept it dependency-free (hand-rolled, no framework). **Still open: SSE** to replace
+  700 ms polling now that the incremental endpoint exists (optional, bigger change).
 
 ### Dead / unused code to remove
 - `proto/scanner/v1/scanner.proto` — unused gRPC contract.
-- `radarFps`/`radar_fps` — there is no radar.
-- `packetsDropped` — always 0.
-- Fabricated metrics in `EdgeDaemon::UpdateMetricsLocked` — see telemetry removal above.
+- ~~`radarFps`/`packetsDropped`/fabricated metrics~~ — removed with the telemetry struct.
 - `SetStatusLed`/`status_led` — defined/configured, never driven.
 - `tick_interval_ms`, `status_broadcast_interval_ms` — parsed, never read.
 - `EdgeService.lastError` — set, never read.
-- **Do NOT** remove `IsMotionBusy()` — it becomes used by continuous scan.
+- **Do NOT** remove `IsMotionBusy()` — it is now load-bearing for continuous scan.
 
 ### Repo hygiene
 - `.gocache/` (≈101 MB, 1339 files) is committed despite being in `.gitignore`. Run
@@ -153,4 +150,6 @@ density) and `sweep` fills cells continuously.
 ### Testing
 - No tests exist. Start with the pure, high-value units: `GenerateStepTimes`
   (trapezoidal profile), the lease state machine, `CoordForIndex` (boustrophedon),
-  and the resolution→stride→grid derivation.
+  the resolution→stride→grid derivation, and now the `GetGridUpdate` /
+  `buildGridUpdateLocked` delta logic (generation bump → full; version cursor →
+  delta; unfilled cells skipped).
