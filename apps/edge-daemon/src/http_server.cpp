@@ -42,9 +42,29 @@ using json = nlohmann::json;
 
 struct Request {
   std::string method;
-  std::string path;
+  std::string path;   // path only; query string stripped off into `query`
+  std::string query;  // raw query string after '?', e.g. "since=12&gen=3"
   std::string body;
 };
+
+// Pulls an unsigned integer query parameter. Returns false if absent (lets the
+// state handler decide whether to attach a grid delta at all).
+bool TryQueryParam(const std::string& query, const std::string& key, std::uint64_t& out) {
+  std::size_t pos = 0;
+  while (pos <= query.size()) {
+    const auto amp = query.find('&', pos);
+    const auto len = (amp == std::string::npos) ? std::string::npos : amp - pos;
+    const std::string pair = query.substr(pos, len);
+    const auto eq = pair.find('=');
+    if (eq != std::string::npos && pair.substr(0, eq) == key) {
+      try { out = std::stoull(pair.substr(eq + 1)); return true; }
+      catch (const std::exception&) { return false; }
+    }
+    if (amp == std::string::npos) break;
+    pos = amp + 1;
+  }
+  return false;
+}
 
 json AxisToJson(const AxisMotion& a) {
   return json{
@@ -109,13 +129,24 @@ json SnapshotToJson(const Snapshot& s) {
       }},
       {"faults", s.faults},
       {"activity", activity},
-      {"grid", s.grid},
   };
   root["lastCompletedScanAt"]   = s.last_completed_scan_at.has_value()
                                       ? json(*s.last_completed_scan_at) : json(nullptr);
   root["controlLeaseExpiresAt"] = s.control_lease_expires_at.has_value()
                                       ? json(*s.control_lease_expires_at) : json(nullptr);
   return root;
+}
+
+json GridUpdateToJson(const GridUpdate& g) {
+  return json{
+      {"generation", g.generation},
+      {"version",    g.version},
+      {"width",      g.width},
+      {"height",     g.height},
+      {"full",       g.full},
+      {"idx",        g.idx},
+      {"val",        g.val},
+  };
 }
 
 Request ParseRequest(const std::string& raw) {
@@ -125,6 +156,13 @@ Request ParseRequest(const std::string& raw) {
 
   std::istringstream line_stream(raw.substr(0, line_end));
   line_stream >> req.method >> req.path;
+
+  // Split the query string off the path so routing stays exact-match.
+  const auto qpos = req.path.find('?');
+  if (qpos != std::string::npos) {
+    req.query = req.path.substr(qpos + 1);
+    req.path  = req.path.substr(0, qpos);
+  }
 
   const auto header_end = raw.find("\r\n\r\n");
   if (header_end != std::string::npos) req.body = raw.substr(header_end + 4);
@@ -255,7 +293,17 @@ int HttpServer::Run() {
         body = json{{"ok", true}}.dump();
 
       } else if (req.method == "GET" && req.path == "/api/hardware/state") {
-        body = SnapshotToJson(daemon_.GetSnapshot()).dump();
+        json root = SnapshotToJson(daemon_.GetSnapshot());
+        // Attach the incremental grid only when the client asks for it (?since=).
+        // Plain /api/hardware/state (no query) — e.g. the Go command-path sync —
+        // omits the grid entirely so command responses stay tiny.
+        std::uint64_t since = 0;
+        if (TryQueryParam(req.query, "since", since)) {
+          std::uint64_t gen = 0;
+          TryQueryParam(req.query, "gen", gen);
+          root["gridUpdate"] = GridUpdateToJson(daemon_.GetGridUpdate(since, gen));
+        }
+        body = root.dump();
 
       } else if (req.method == "POST" && req.path == "/api/hardware/command") {
         CommandRequest command;

@@ -446,8 +446,8 @@ void EdgeDaemon::ScanWorker() {
       });
       if (scan_state_ == ScanState::Stopping) return;
 
-      width  = state_.grid.empty() ? 0 : static_cast<int>(state_.grid.front().size());
-      height = static_cast<int>(state_.grid.size());
+      width  = grid_w_;
+      height = grid_h_;
       if (width == 0 || height == 0) {
         scan_state_ = ScanState::Idle;
         state_.mode = "idle";
@@ -511,7 +511,7 @@ void EdgeDaemon::ScanWorker() {
 
     // Normalise to a 0..1 "surface confidence" band for the web UI heatmap.
     const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
-    state_.grid[y][x] = Round(normalised, 10000.0);
+    MarkCellLocked(x, y, Round(normalised, 10000.0));
     filled_cells_ = std::max(filled_cells_, index + 1);
     scan_index_ = index + 1;
 
@@ -547,8 +547,8 @@ void EdgeDaemon::ScanWorkerSweep() {
       });
       if (scan_state_ == ScanState::Stopping) return;
 
-      width  = state_.grid.empty() ? 0 : static_cast<int>(state_.grid.front().size());
-      height = static_cast<int>(state_.grid.size());
+      width  = grid_w_;
+      height = grid_h_;
       if (width == 0 || height == 0) {
         scan_state_ = ScanState::Idle;
         state_.mode = "idle";
@@ -625,7 +625,7 @@ void EdgeDaemon::ScanWorkerSweep() {
       const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
       std::scoped_lock lock(mutex_);
       if (scan_state_ == ScanState::Stopping) { aborted = true; }
-      else { state_.grid[row][x] = Round(normalised, 10000.0); }
+      else { MarkCellLocked(x, row, Round(normalised, 10000.0)); }
       if (aborted) { motion_->AbortMotion(); break; }
     }
 
@@ -705,8 +705,7 @@ void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
 
   state_.scan_settings.resolution = preset;
   state_.scan_settings.sample_stride_microsteps = stride;
-  state_.grid.assign(static_cast<std::size_t>(height),
-                     std::vector<double>(static_cast<std::size_t>(width), -1.0));
+  RebuildGridLocked(static_cast<int>(width), static_cast<int>(height));
 
   double duration_s;
   if (config_.scan.mode == "sweep") {
@@ -725,13 +724,63 @@ void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
 }
 
 void EdgeDaemon::ResetScanLocked() {
-  for (auto& row : state_.grid) std::fill(row.begin(), row.end(), -1.0);
+  ClearGridLocked();  // wipe cells + bump generation so clients full-refresh to empty
   state_.coverage = 0.0;
   state_.scan_progress = 0.0;
   state_.last_completed_scan_at.reset();
   filled_cells_ = 0;
   scan_index_ = 0;
   scan_row_ = 0;
+}
+
+void EdgeDaemon::RebuildGridLocked(int width, int height) {
+  grid_w_ = std::max(0, width);
+  grid_h_ = std::max(0, height);
+  grid_.assign(static_cast<std::size_t>(grid_h_),
+               std::vector<double>(static_cast<std::size_t>(grid_w_), -1.0));
+  cell_version_.assign(static_cast<std::size_t>(grid_w_) * static_cast<std::size_t>(grid_h_), 0);
+  ++grid_generation_;
+  grid_version_ = 0;
+}
+
+void EdgeDaemon::ClearGridLocked() {
+  for (auto& row : grid_) std::fill(row.begin(), row.end(), -1.0);
+  std::fill(cell_version_.begin(), cell_version_.end(), std::uint64_t{0});
+  ++grid_generation_;
+  grid_version_ = 0;
+}
+
+void EdgeDaemon::MarkCellLocked(int x, int y, double value) {
+  if (x < 0 || y < 0 || x >= grid_w_ || y >= grid_h_) return;
+  grid_[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] = value;
+  cell_version_[static_cast<std::size_t>(y) * static_cast<std::size_t>(grid_w_) +
+                static_cast<std::size_t>(x)] = ++grid_version_;
+}
+
+GridUpdate EdgeDaemon::GetGridUpdate(std::uint64_t since_version,
+                                     std::uint64_t client_generation) const {
+  std::scoped_lock lock(mutex_);
+  GridUpdate gu;
+  gu.generation = grid_generation_;
+  gu.version = grid_version_;
+  gu.width = grid_w_;
+  gu.height = grid_h_;
+  // A stale client generation (fresh client, or post-resize/reset) ⇒ send every
+  // filled cell so it can rebuild; otherwise only cells changed since its version.
+  gu.full = (client_generation != grid_generation_);
+  for (int y = 0; y < grid_h_; ++y) {
+    for (int x = 0; x < grid_w_; ++x) {
+      const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(grid_w_) +
+                            static_cast<std::size_t>(x);
+      const double v = grid_[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
+      if (v < 0.0) continue;  // unfilled cells aren't transmitted; clients default to -1
+      if (gu.full || cell_version_[i] > since_version) {
+        gu.idx.push_back(static_cast<int>(i));
+        gu.val.push_back(v);
+      }
+    }
+  }
+  return gu;
 }
 
 void EdgeDaemon::AddLogLocked(const std::string& source, const std::string& level,

@@ -36,6 +36,11 @@ type state struct {
 	grid                [][]float64
 	gridW               int
 	gridH               int
+	// Incremental-grid bookkeeping (mirrors the daemon). cellVersion is flat
+	// (row-major, len gridW*gridH); gridGeneration bumps on resize/reset.
+	gridGeneration uint64
+	gridVersion    uint64
+	cellVersion    []uint64
 	scanSettings        ScanSettings
 	metrics             Metrics
 	faults              []string
@@ -132,6 +137,9 @@ func (s *Service) applyResolutionLocked(preset string) {
 	s.state.gridW = w
 	s.state.gridH = h
 	s.state.grid = newGrid(w, h)
+	s.state.cellVersion = make([]uint64, w*h)
+	s.state.gridGeneration++ // new grid identity ⇒ clients full-refresh
+	s.state.gridVersion = 0
 	s.state.scanSettings.Resolution = preset
 	s.state.scanSettings.SampleStrideMicrosteps = stride
 	s.state.filledCells = 0
@@ -145,6 +153,44 @@ func (s *Service) Snapshot() Snapshot {
 
 	s.updateLocked()
 	return s.snapshotLocked()
+}
+
+// SnapshotDelta is the polled path: it attaches an incremental GridUpdate for
+// the client's since/generation cursor (full grid when the generation is stale).
+func (s *Service) SnapshotDelta(since, gen uint64) Snapshot {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.updateLocked()
+	snap := s.snapshotLocked()
+	snap.GridUpdate = s.buildGridUpdateLocked(since, gen)
+	return snap
+}
+
+func (s *Service) buildGridUpdateLocked(since, gen uint64) *GridUpdate {
+	gu := &GridUpdate{
+		Generation: s.state.gridGeneration,
+		Version:    s.state.gridVersion,
+		Width:      s.state.gridW,
+		Height:     s.state.gridH,
+		Full:       gen != s.state.gridGeneration,
+		Idx:        []int{},
+		Val:        []float64{},
+	}
+	for y := 0; y < s.state.gridH; y++ {
+		for x := 0; x < s.state.gridW; x++ {
+			i := y*s.state.gridW + x
+			v := s.state.grid[y][x]
+			if v < 0 {
+				continue // unfilled — the client defaults empties to -1
+			}
+			if gu.Full || s.state.cellVersion[i] > since {
+				gu.Idx = append(gu.Idx, i)
+				gu.Val = append(gu.Val, v)
+			}
+		}
+	}
+	return gu
 }
 
 func (s *Service) Acquire(user string) (Snapshot, error) {
@@ -401,7 +447,7 @@ func (s *Service) snapshotLocked() Snapshot {
 		Metrics:               s.state.metrics,
 		Faults:                cloneStrings(s.state.faults),
 		Activity:              cloneActivity(s.state.activity),
-		Grid:                  cloneGrid(s.state.grid),
+		// GridUpdate is attached only by SnapshotDelta (the poll path).
 	}
 }
 
@@ -435,6 +481,9 @@ func (s *Service) requireControlLocked(user string) error {
 
 func (s *Service) resetScanLocked() {
 	s.state.grid = newGrid(s.state.gridW, s.state.gridH)
+	s.state.cellVersion = make([]uint64, s.state.gridW*s.state.gridH)
+	s.state.gridGeneration++ // wiped grid ⇒ clients full-refresh to empty
+	s.state.gridVersion = 0
 	s.state.coverage = 0
 	s.state.scanProgress = 0
 	s.state.filledCells = 0
@@ -462,7 +511,9 @@ func (s *Service) fillToLocked(target int) {
 
 	for i := s.state.filledCells; i < target; i++ {
 		x, y := coordForIndex(i, s.state.gridW)
+		s.state.gridVersion++
 		s.state.grid[y][x] = sampleHeight(x, y, s.state.gridW, s.state.gridH)
+		s.state.cellVersion[y*s.state.gridW+x] = s.state.gridVersion
 	}
 
 	s.state.filledCells = target
@@ -506,14 +557,6 @@ func newGrid(w, h int) [][]float64 {
 		}
 	}
 	return grid
-}
-
-func cloneGrid(in [][]float64) [][]float64 {
-	out := make([][]float64, len(in))
-	for i := range in {
-		out[i] = append([]float64(nil), in[i]...)
-	}
-	return out
 }
 
 func cloneStrings(in []string) []string {

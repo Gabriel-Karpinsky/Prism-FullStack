@@ -87,7 +87,10 @@
                     <h2>Live surface map</h2>
                     <p>Synthetic height data is filled in raster order to mimic a cliff-face scan.</p>
                 </div>
-                <canvas id="surface-map" width="960" height="480"></canvas>
+                <div class="map-stack">
+                    <canvas id="surface-map" width="960" height="480"></canvas>
+                    <canvas id="surface-overlay" width="960" height="480"></canvas>
+                </div>
                 <div class="map-legend">
                     <span>Low</span>
                     <div class="legend-bar"></div>

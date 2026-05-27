@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <vector>
@@ -50,7 +51,25 @@ struct Snapshot {
   Metrics metrics;
   std::vector<std::string> faults;
   std::vector<ActivityEntry> activity;
-  std::vector<std::vector<double>> grid;
+  // The scan grid is no longer carried in the Snapshot — it can be hundreds of
+  // thousands of cells. It's fetched incrementally via GridUpdate (see below)
+  // so a poll only ships the cells that changed since the client's last version.
+};
+
+// Incremental scan-grid update. The client holds the grid locally and applies
+// deltas: each poll sends ?since=<version>&gen=<generation>, and we return only
+// the cells whose value changed since that version (or all filled cells when
+// the client's generation is stale — e.g. after a resolution change or scan
+// reset, which bump the generation). idx/val are parallel arrays; idx is the
+// row-major cell index (y*width + x), val the normalised 0..1 height.
+struct GridUpdate {
+  std::uint64_t generation = 0;  // grid identity; changes on resize/reset
+  std::uint64_t version = 0;     // monotonic change counter (resets on generation bump)
+  int width = 0;
+  int height = 0;
+  bool full = false;             // true ⇒ client should rebuild from idx/val
+  std::vector<int> idx;
+  std::vector<double> val;
 };
 
 struct CommandRequest {

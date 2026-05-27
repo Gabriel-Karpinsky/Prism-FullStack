@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -15,7 +16,11 @@ import (
 )
 
 type apiService interface {
+	// Snapshot returns current state without a grid payload (used for error
+	// responses and command/lease decoration). SnapshotDelta is the polled path:
+	// it carries an incremental GridUpdate for the client's since/generation.
 	Snapshot() scanner.Snapshot
+	SnapshotDelta(sinceVersion, gen uint64) scanner.Snapshot
 	Acquire(user string) (scanner.Snapshot, error)
 	Release(user string) (scanner.Snapshot, error)
 	Command(user, command string, payload map[string]any) (scanner.Snapshot, error)
@@ -66,7 +71,8 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method not allowed."})
 			return
 		}
-		writeJSON(w, http.StatusOK, service.Snapshot())
+		since, gen := parseGridCursor(r)
+		writeJSON(w, http.StatusOK, service.SnapshotDelta(since, gen))
 	})
 
 	mux.HandleFunc("/api/control/acquire", func(w http.ResponseWriter, r *http.Request) {
@@ -230,6 +236,20 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_, _ = w.Write(payload)
+}
+
+// parseGridCursor reads the incremental-grid cursor the UI sends on /api/state.
+// Both default to 0 (a fresh client), which the backend treats as "send a full
+// grid". Unparseable values fall back to 0.
+func parseGridCursor(r *http.Request) (since uint64, gen uint64) {
+	q := r.URL.Query()
+	if v, err := strconv.ParseUint(q.Get("since"), 10, 64); err == nil {
+		since = v
+	}
+	if v, err := strconv.ParseUint(q.Get("gen"), 10, 64); err == nil {
+		gen = v
+	}
+	return since, gen
 }
 
 func envOrDefault(key, fallback string) string {

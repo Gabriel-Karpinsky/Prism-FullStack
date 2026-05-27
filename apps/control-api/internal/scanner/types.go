@@ -43,6 +43,21 @@ type MotionConfig struct {
 	Pitch AxisMotion `json:"pitch"`
 }
 
+// GridUpdate is the incremental scan-grid payload. The client holds the grid
+// locally and applies deltas: idx/val are parallel arrays (idx = row-major cell
+// index y*Width+x, val = normalised 0..1 height). Full means "rebuild from these
+// cells" (sent when the client's generation is stale, e.g. after a resolution
+// change or scan reset, which bump Generation). See the daemon's GetGridUpdate.
+type GridUpdate struct {
+	Generation uint64    `json:"generation"`
+	Version    uint64    `json:"version"`
+	Width      int       `json:"width"`
+	Height     int       `json:"height"`
+	Full       bool      `json:"full"`
+	Idx        []int     `json:"idx"`
+	Val        []float64 `json:"val"`
+}
+
 type Snapshot struct {
 	Connected             bool            `json:"connected"`
 	Mode                  string          `json:"mode"`
@@ -58,5 +73,8 @@ type Snapshot struct {
 	Metrics               Metrics         `json:"metrics"`
 	Faults                []string        `json:"faults"`
 	Activity              []ActivityEntry `json:"activity"`
-	Grid                  [][]float64     `json:"grid"`
+	// GridUpdate is only populated on the polled /api/state path (when the client
+	// sends ?since=). Command/acquire/release responses leave it nil so they stay
+	// small; the UI refreshes the grid from the poll loop.
+	GridUpdate *GridUpdate `json:"gridUpdate,omitempty"`
 }
