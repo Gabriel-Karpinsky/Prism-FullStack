@@ -23,6 +23,8 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <string>
+#include <thread>
 #include <utility>
 
 namespace edge {
@@ -110,6 +112,7 @@ void EdgeDaemon::Stop() {
   scan_cv_.notify_all();
   if (motion_) motion_->AbortMotion();
   if (scan_worker_.joinable()) scan_worker_.join();
+  if (move_worker_.joinable()) move_worker_.join();  // B8: reap any async jog/home
   if (safety_) safety_->Stop();
   if (motion_ && was_running) motion_->SetEnabled(false);
   if (gpio_   && was_running) gpio_->Shutdown();
@@ -199,19 +202,23 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
   // ESTOP and clear_fault are always accepted, even while the system is faulted.
   if (cmd == "estop") {
     safety_->TriggerEStop("operator e-stop");
-    std::thread prev;
+    std::thread prev_scan;
+    std::thread prev_move;
     {
       std::scoped_lock lock(mutex_);
       state_.mode = "fault";
       if (state_.faults.empty()) state_.faults = {"Emergency stop asserted."};
       if (scan_state_ != ScanState::Idle) {
         scan_state_ = ScanState::Stopping;
-        prev = std::move(scan_worker_);
+        prev_scan = std::move(scan_worker_);
       }
+      if (manual_move_active_) prev_move = std::move(move_worker_);  // B8: stop an async jog/home too
       AddLogLocked("safety", "error", "Emergency stop triggered.");
     }
+    motion_->AbortMotion();  // halt any in-flight motion (scan move or manual jog/home)
     scan_cv_.notify_all();
-    if (prev.joinable()) prev.join();
+    if (prev_scan.joinable()) prev_scan.join();
+    if (prev_move.joinable()) prev_move.join();
     return GetSnapshot();
   }
 
@@ -253,24 +260,27 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
   }
 
   if (cmd == "home") {
+    std::thread old_move;
     {
       std::scoped_lock lock(mutex_);
       if (scan_state_ != ScanState::Idle) {
         error_message = "Stop the current scan before homing.";
         return state_;
       }
+      if (manual_move_active_) {
+        error_message = "A move is already in progress.";
+        return state_;
+      }
+      old_move = std::move(move_worker_);  // reap the finished previous move (if any)
+      manual_move_active_ = true;
       state_.mode = "manual";
       AddLogLocked("motion", "info", "Homing to (0, 0).");
     }
-    const auto result = motion_->Home();
-    std::scoped_lock lock(mutex_);
-    if (!result.success) {
-      error_message = "Home failed: " + result.error;
-      FailLocked(error_message);
-    } else {
-      state_.mode = "idle";
-    }
-    return state_;
+    // B8: run the move off the HTTP thread and return immediately. The UI polls
+    // /api/state and sees mode flip "manual" -> "idle" (or "fault") on completion.
+    if (old_move.joinable()) old_move.join();
+    move_worker_ = std::thread(&EdgeDaemon::ManualMoveWorker, this, 0.0, 0.0, true);
+    return GetSnapshot();
   }
 
   if (cmd == "jog") {
@@ -281,10 +291,15 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
     }
     double target_yaw;
     double target_pitch;
+    std::thread old_move;
     {
       std::scoped_lock lock(mutex_);
       if (scan_state_ != ScanState::Idle) {
         error_message = "Stop the current scan before jogging.";
+        return state_;
+      }
+      if (manual_move_active_) {
+        error_message = "A move is already in progress.";
         return state_;
       }
       // B6: refuse to jog from an untrusted position (an aborted move left
@@ -298,18 +313,15 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
       target_pitch = motion_->pitch_deg();
       if (request.axis == "yaw") target_yaw   += request.delta;
       else                       target_pitch += request.delta;
+      old_move = std::move(move_worker_);
+      manual_move_active_ = true;
       state_.mode = "manual";
       AddLogLocked("motion", "info", std::string("Jog ") + request.axis + ".");
     }
-    const auto result = motion_->MoveTo(target_yaw, target_pitch);
-    std::scoped_lock lock(mutex_);
-    if (!result.success) {
-      error_message = "Jog failed: " + result.error;
-      FailLocked(error_message);
-    } else {
-      state_.mode = "idle";
-    }
-    return state_;
+    // B8: offload to the move worker; return immediately (see "home" above).
+    if (old_move.joinable()) old_move.join();
+    move_worker_ = std::thread(&EdgeDaemon::ManualMoveWorker, this, target_yaw, target_pitch, false);
+    return GetSnapshot();
   }
 
   if (cmd == "start_scan") {
@@ -318,6 +330,12 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
       std::scoped_lock lock(mutex_);
       if (scan_state_ != ScanState::Idle) {
         error_message = "Stop the current scan before starting a new one.";
+        return state_;
+      }
+      // B8: a manual jog/home runs on the move worker; don't let a scan start
+      // driving motion while one is in flight.
+      if (manual_move_active_) {
+        error_message = "Wait for the current move to finish before scanning.";
         return state_;
       }
       // B6: a scan is a long sequence of planned moves; refuse to start one from
@@ -393,6 +411,25 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
   return state_;
 }
 
+// B8: runs a single home/jog off the HTTP thread. The blocking MotionController
+// call (which drives the DMA waveform to completion or abort) happens here, not
+// on the request thread, so /api/state polling — and thus the safety heartbeat
+// — stays responsive throughout a multi-second move.
+void EdgeDaemon::ManualMoveWorker(double yaw_deg, double pitch_deg, bool is_home) {
+  const auto result = is_home ? motion_->Home() : motion_->MoveTo(yaw_deg, pitch_deg);
+
+  std::scoped_lock lock(mutex_);
+  manual_move_active_ = false;
+  // If an estop/fault landed while we were moving, it owns the state — don't
+  // clobber the "fault" mode or re-latch.
+  if (safety_->faulted()) return;
+  if (!result.success) {
+    FailLocked(std::string(is_home ? "Home" : "Jog") + " failed: " + result.error);
+  } else if (state_.mode == "manual") {
+    state_.mode = "idle";
+  }
+}
+
 void EdgeDaemon::ScanWorker() {
   if (config_.scan.mode == "sweep") {
     ScanWorkerSweep();
@@ -441,14 +478,32 @@ void EdgeDaemon::ScanWorker() {
       if (scan_state_ == ScanState::Paused) continue;  // don't capture; re-park on CV
     }
 
-    gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
-    const double distance = lidar_->ReadDistanceMeters(tgt_yaw, tgt_pitch);
+    // B11: a single noisy I²C read shouldn't discard the whole scan. Retry a
+    // few times (re-triggering and letting the bus settle between attempts)
+    // before latching a LidarFault. Sweep mode already tolerates dropped reads
+    // by skipping the cell; step mode used to latch on the very first NaN.
+    constexpr int kLidarReadAttempts = 3;
+    double distance = 0.0;
+    bool got_reading = false;
+    for (int attempt = 0; attempt < kLidarReadAttempts; ++attempt) {
+      if (attempt > 0) {
+        {
+          std::scoped_lock lock(mutex_);
+          if (scan_state_ == ScanState::Stopping) return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));  // let I²C settle
+      }
+      gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
+      distance = lidar_->ReadDistanceMeters(tgt_yaw, tgt_pitch);
+      if (!std::isnan(distance)) { got_reading = true; break; }
+    }
 
     std::scoped_lock lock(mutex_);
     if (scan_state_ == ScanState::Stopping) return;
 
-    if (std::isnan(distance)) {
-      FailLocked("Lidar read failed: " + lidar_->last_error());
+    if (!got_reading) {
+      FailLocked("Lidar read failed after " + std::to_string(kLidarReadAttempts) +
+                 " attempts: " + lidar_->last_error());
       safety_->TriggerFault(FaultCode::LidarFault, lidar_->last_error());
       scan_state_ = ScanState::Idle;
       return;

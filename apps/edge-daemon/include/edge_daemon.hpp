@@ -18,8 +18,10 @@ namespace edge {
 
 // EdgeDaemon ties the hardware layer together and exposes a thread-safe
 // snapshot + command API to the HTTP server. Long-running scans run in a
-// dedicated worker thread; manual jogs and homes block the calling HTTP
-// thread (the Go control-api times these calls out at the transport layer).
+// dedicated worker thread; manual jogs and homes are likewise offloaded to a
+// move worker (B8) so they return immediately with mode "manual" and the UI
+// polls /api/state for completion — a multi-second home no longer blocks all
+// polling (which would also starve the safety heartbeat).
 class EdgeDaemon {
  public:
   explicit EdgeDaemon(Config config);
@@ -51,6 +53,7 @@ class EdgeDaemon {
 
   void ScanWorker();        // dispatches to step or sweep loop by config_.scan.mode
   void ScanWorkerSweep();   // continuous: sweep each row while sampling on the fly
+  void ManualMoveWorker(double yaw_deg, double pitch_deg, bool is_home);  // async home/jog (B8)
   std::pair<int, int> CoordForIndex(int index, int width) const;
   double TargetYawForCell(int x, int width) const;
   double TargetPitchForCell(int y, int height) const;
@@ -67,6 +70,8 @@ class EdgeDaemon {
 
   std::condition_variable scan_cv_;
   std::thread scan_worker_;
+  std::thread move_worker_;            // runs an async home/jog (B8)
+  bool manual_move_active_ = false;    // guarded by mutex_; a move worker is in flight
   ScanState scan_state_ = ScanState::Idle;
   int scan_index_ = 0;   // cell cursor (step mode)
   int scan_row_ = 0;     // row cursor (sweep mode)
