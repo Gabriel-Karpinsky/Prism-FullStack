@@ -251,6 +251,29 @@ logged warning; genuine per-microstep detail comes from scanning a *small*
 yaw/pitch range. The web UI shows the resulting grid size and time estimate
 live under the density selector.
 
+### Scan mode: sweep vs step (`scan.mode`)
+
+There are two ways the worker visits cells:
+
+- **`step` (stop-and-shoot)** — `ScanWorker` moves point-to-point to each cell,
+  stops, then reads the LIDAR while stationary. Simple, but the gantry
+  accelerates and decelerates to a dead stop *every cell*, which dominates the
+  time — the ~20 ms LIDAR read is the smallest part.
+- **`sweep` (continuous, default)** — `ScanWorkerSweep` sweeps yaw across a
+  whole row at a constant velocity (one accel/decel per *row*) while the LIDAR
+  samples on the fly; each reading is binned to a cell by the head's position.
+  Pitch steps once per row; boustrophedon means no inter-row repositioning.
+
+The sweep velocity is **LIDAR-limited**: `v = min(sweep_max_speed_deg_s,
+cell_width / lidar_period)`, so the head advances at most ~one cell per LIDAR
+measurement — the fastest that still samples every cell. Position during the
+sweep is open-loop, derived from elapsed time against the committed trapezoidal
+profile (`MotionController::SweepMicrostepsTravelled`). The non-blocking
+`StartMotionWaveform` / `FinishMotionWaveform` GPIO primitives let the worker
+run the DMA sweep and sample concurrently. Sweep is typically 5–20× faster than
+step and makes fine/max density practical. Tunables live under `scan.*` in
+`hardware.json` (see hardware-setup.md §9).
+
 ---
 
 ## 7. Motion: degrees → steps → DMA waveform

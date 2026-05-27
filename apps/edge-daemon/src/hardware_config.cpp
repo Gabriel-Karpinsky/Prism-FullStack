@@ -83,6 +83,12 @@ json ConfigToJson(const Config& c) {
           {"tick_interval_ms", c.service.tick_interval_ms},
           {"status_broadcast_interval_ms", c.service.status_broadcast_interval_ms},
       }},
+      {"scan", {
+          {"mode", c.scan.mode},
+          {"sweep_max_speed_deg_s", c.scan.sweep_max_speed_deg_s},
+          {"sweep_accel_deg_s2", c.scan.sweep_accel_deg_s2},
+          {"lidar_period_ms", c.scan.lidar_period_ms},
+      }},
       {"simulate_hardware", c.simulate_hardware},
   };
 }
@@ -113,6 +119,7 @@ Config DefaultConfig() {
   c.safety = {1500, 4, 25};
   c.lidar = {1, 0x62, false};
   c.service = {"127.0.0.1", 9090, 48, 24, 20, 100};
+  c.scan = {"sweep", 120.0, 800.0, 30};
   c.simulate_hardware = false;
   return c;
 }
@@ -167,6 +174,12 @@ Config LoadConfigFromFile(const std::string& path) {
     c.service.grid_height                 = Get(*it, "grid_height",                 c.service.grid_height);
     c.service.tick_interval_ms            = Get(*it, "tick_interval_ms",            c.service.tick_interval_ms);
     c.service.status_broadcast_interval_ms = Get(*it, "status_broadcast_interval_ms", c.service.status_broadcast_interval_ms);
+  }
+  if (auto it = doc.find("scan"); it != doc.end() && it->is_object()) {
+    c.scan.mode                  = Get<std::string>(*it, "mode", c.scan.mode);
+    c.scan.sweep_max_speed_deg_s = Get(*it, "sweep_max_speed_deg_s", c.scan.sweep_max_speed_deg_s);
+    c.scan.sweep_accel_deg_s2    = Get(*it, "sweep_accel_deg_s2",    c.scan.sweep_accel_deg_s2);
+    c.scan.lidar_period_ms       = Get(*it, "lidar_period_ms",       c.scan.lidar_period_ms);
   }
   c.simulate_hardware = Get(doc, "simulate_hardware", c.simulate_hardware);
   return c;

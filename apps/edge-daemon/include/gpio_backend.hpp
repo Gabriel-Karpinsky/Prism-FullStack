@@ -39,6 +39,13 @@ class IGpioBackend {
   // Returns false with error populated on failure (e.g. pigpio resource exhaustion).
   virtual bool RunMotionWaveform(const WaveformPlan& plan, std::string& error) = 0;
 
+  // Non-blocking variant for continuous sweeps: launch the waveform and return
+  // immediately. Poll IsMotionBusy() to follow completion, then call
+  // FinishMotionWaveform() to release DMA resources. RunMotionWaveform is
+  // equivalent to Start + Finish.
+  virtual bool StartMotionWaveform(const WaveformPlan& plan, std::string& error) = 0;
+  virtual void FinishMotionWaveform() = 0;
+
   virtual bool IsMotionBusy() const = 0;
   virtual void AbortMotion() = 0;
 

@@ -27,7 +27,9 @@ class StepperAxis {
   double target_deg() const { return last_target_deg_; }
 
   // Trapezoidal-profile plan from current position to (clamped) target.
-  MovePlan PlanMove(double target_deg) const;
+  // speed_deg_s / accel_deg_s2 of 0 mean "use this axis's motion envelope";
+  // pass overrides to plan a faster continuous sweep.
+  MovePlan PlanMove(double target_deg, double speed_deg_s = 0.0, double accel_deg_s2 = 0.0) const;
 
   // Applied once the waveform executed successfully.
   void Commit(const MovePlan& plan);
@@ -35,6 +37,16 @@ class StepperAxis {
   // Called after an aborted waveform: position is no longer trusted.
   void MarkPositionUnknown() { position_known_ = false; }
   bool position_known() const { return position_known_; }
+
+  // Re-establish a known datum without motion. With no endstops, the only way
+  // to recover after position tracking is lost is for the operator to hand-zero
+  // the gantry and then declare the current physical pose as zero. Restores
+  // tracking so moves are permitted again (B6 recovery path).
+  void ResetToZero() {
+    current_microsteps_ = 0;
+    last_target_deg_ = 0.0;
+    position_known_ = true;
+  }
 
   AxisId id() const { return id_; }
   double microsteps_per_deg() const { return microsteps_per_deg_; }

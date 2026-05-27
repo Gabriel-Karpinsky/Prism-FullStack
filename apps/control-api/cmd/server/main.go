@@ -7,14 +7,20 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"time"
 
 	"cliffscanner/control-api/internal/edgeclient"
 	"cliffscanner/control-api/internal/scanner"
 )
 
 type apiService interface {
+	// Snapshot returns current state without a grid payload (used for error
+	// responses and command/lease decoration). SnapshotDelta is the polled path:
+	// it carries an incremental GridUpdate for the client's since/generation.
 	Snapshot() scanner.Snapshot
+	SnapshotDelta(sinceVersion, gen uint64) scanner.Snapshot
 	Acquire(user string) (scanner.Snapshot, error)
 	Release(user string) (scanner.Snapshot, error)
 	Command(user, command string, payload map[string]any) (scanner.Snapshot, error)
@@ -65,7 +71,8 @@ func main() {
 			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "Method not allowed."})
 			return
 		}
-		writeJSON(w, http.StatusOK, service.Snapshot())
+		since, gen := parseGridCursor(r)
+		writeJSON(w, http.StatusOK, service.SnapshotDelta(since, gen))
 	})
 
 	mux.HandleFunc("/api/control/acquire", func(w http.ResponseWriter, r *http.Request) {
@@ -75,8 +82,8 @@ func main() {
 		}
 
 		var req acquireRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "state": service.Snapshot()})
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "state": service.Snapshot()})
 			return
 		}
 
@@ -95,8 +102,8 @@ func main() {
 		}
 
 		var req acquireRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "state": service.Snapshot()})
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "state": service.Snapshot()})
 			return
 		}
 
@@ -115,8 +122,8 @@ func main() {
 		}
 
 		var req commandRequest
-		if err := decodeJSON(r, &req); err != nil {
-			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "state": service.Snapshot()})
+		if err := decodeJSON(w, r, &req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error(), "state": service.Snapshot()})
 			return
 		}
 
@@ -141,7 +148,7 @@ func main() {
 			writeJSON(w, http.StatusOK, cfg)
 		case http.MethodPut:
 			var req motionConfigRequest
-			if err := decodeJSON(r, &req); err != nil {
+			if err := decodeJSON(w, r, &req); err != nil {
 				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 				return
 			}
@@ -156,8 +163,22 @@ func main() {
 		}
 	})
 
+	// Explicit timeouts: a default http.Server has none, leaving it open to
+	// slowloris (a client that dribbles a request out forever ties up a
+	// connection). WriteTimeout is generous because some responses proxy to the
+	// edge daemon. MaxHeaderBytes bounds the header buffer (B5).
+	srv := &http.Server{
+		Addr:              listenAddr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      15 * time.Second,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    1 << 16, // 64 KiB
+	}
+
 	log.Printf("Go control API listening on http://%s\n", listenAddr)
-	if err := http.ListenAndServe(listenAddr, mux); err != nil {
+	if err := srv.ListenAndServe(); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -182,13 +203,22 @@ func serveFile(path, contentType string) http.HandlerFunc {
 	}
 }
 
-func decodeJSON(r *http.Request, dst any) error {
+// maxRequestBodyBytes caps the JSON body we'll read on any control endpoint.
+// Control payloads (lease user, command, motion envelope) are a few hundred
+// bytes; this is generous headroom while closing the unbounded-read DoS (B5).
+const maxRequestBodyBytes = 1 << 20 // 1 MiB
+
+func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {
 	defer r.Body.Close()
 
 	if r.ContentLength == 0 {
 		return errors.New("request body is required")
 	}
 
+	// MaxBytesReader caps the bytes read and, with the ResponseWriter, marks the
+	// connection to close once the limit is hit — so a client can't stream an
+	// unbounded body (or lie about Content-Length) to exhaust memory.
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	decoder := json.NewDecoder(r.Body)
 	if err := decoder.Decode(dst); err != nil {
 		return err
@@ -197,7 +227,9 @@ func decodeJSON(r *http.Request, dst any) error {
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
-	payload, err := json.MarshalIndent(body, "", "  ")
+	// Compact JSON: every response is machine-read (the UI or the edge client),
+	// and the grid payloads can be large — pretty-printing wastes bytes and CPU.
+	payload, err := json.Marshal(body)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -206,6 +238,20 @@ func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_, _ = w.Write(payload)
+}
+
+// parseGridCursor reads the incremental-grid cursor the UI sends on /api/state.
+// Both default to 0 (a fresh client), which the backend treats as "send a full
+// grid". Unparseable values fall back to 0.
+func parseGridCursor(r *http.Request) (since uint64, gen uint64) {
+	q := r.URL.Query()
+	if v, err := strconv.ParseUint(q.Get("since"), 10, 64); err == nil {
+		since = v
+	}
+	if v, err := strconv.ParseUint(q.Get("gen"), 10, 64); err == nil {
+		gen = v
+	}
+	return since, gen
 }
 
 func envOrDefault(key, fallback string) string {

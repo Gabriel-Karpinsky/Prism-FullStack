@@ -23,6 +23,8 @@
 #include <ctime>
 #include <iomanip>
 #include <sstream>
+#include <string>
+#include <thread>
 #include <utility>
 
 namespace edge {
@@ -63,6 +65,8 @@ EdgeDaemon::EdgeDaemon(Config config) : config_(std::move(config)) {
   state_.scan_settings.pitch_max = config_.motion.pitch.max_deg;
   state_.scan_settings.sweep_speed_deg_per_sec =
       std::min(config_.motion.yaw.max_speed_deg_s, config_.motion.pitch.max_speed_deg_s);
+  state_.scan_settings.scan_mode = config_.scan.mode;
+  state_.scan_settings.sweep_max_speed_deg_s = config_.scan.sweep_max_speed_deg_s;
 
   ApplyResolutionLocked(state_.scan_settings.resolution);
   ResetScanLocked();
@@ -110,6 +114,7 @@ void EdgeDaemon::Stop() {
   scan_cv_.notify_all();
   if (motion_) motion_->AbortMotion();
   if (scan_worker_.joinable()) scan_worker_.join();
+  if (move_worker_.joinable()) move_worker_.join();  // B8: reap any async jog/home
   if (safety_) safety_->Stop();
   if (motion_ && was_running) motion_->SetEnabled(false);
   if (gpio_   && was_running) gpio_->Shutdown();
@@ -199,19 +204,23 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
   // ESTOP and clear_fault are always accepted, even while the system is faulted.
   if (cmd == "estop") {
     safety_->TriggerEStop("operator e-stop");
-    std::thread prev;
+    std::thread prev_scan;
+    std::thread prev_move;
     {
       std::scoped_lock lock(mutex_);
       state_.mode = "fault";
       if (state_.faults.empty()) state_.faults = {"Emergency stop asserted."};
       if (scan_state_ != ScanState::Idle) {
         scan_state_ = ScanState::Stopping;
-        prev = std::move(scan_worker_);
+        prev_scan = std::move(scan_worker_);
       }
+      if (manual_move_active_) prev_move = std::move(move_worker_);  // B8: stop an async jog/home too
       AddLogLocked("safety", "error", "Emergency stop triggered.");
     }
+    motion_->AbortMotion();  // halt any in-flight motion (scan move or manual jog/home)
     scan_cv_.notify_all();
-    if (prev.joinable()) prev.join();
+    if (prev_scan.joinable()) prev_scan.join();
+    if (prev_move.joinable()) prev_move.join();
     return GetSnapshot();
   }
 
@@ -252,25 +261,47 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
     return state_;
   }
 
+  if (cmd == "set_scan_mode") {
+    std::scoped_lock lock(mutex_);
+    if (scan_state_ != ScanState::Idle) {
+      error_message = "Stop the current scan before changing scan mode.";
+      return state_;
+    }
+    if (request.mode != "sweep" && request.mode != "step") {
+      error_message = "Scan mode must be 'sweep' or 'step'.";
+      return state_;
+    }
+    config_.scan.mode = request.mode;
+    state_.scan_settings.scan_mode = request.mode;
+    // Re-derive the grid + duration estimate (sweep vs step time very differently)
+    // and reset the pending scan for the new mode.
+    ApplyResolutionLocked(state_.scan_settings.resolution);
+    AddLogLocked("scanner", "info", "Scan mode set to " + request.mode + ".");
+    return state_;
+  }
+
   if (cmd == "home") {
+    std::thread old_move;
     {
       std::scoped_lock lock(mutex_);
       if (scan_state_ != ScanState::Idle) {
         error_message = "Stop the current scan before homing.";
         return state_;
       }
+      if (manual_move_active_) {
+        error_message = "A move is already in progress.";
+        return state_;
+      }
+      old_move = std::move(move_worker_);  // reap the finished previous move (if any)
+      manual_move_active_ = true;
       state_.mode = "manual";
       AddLogLocked("motion", "info", "Homing to (0, 0).");
     }
-    const auto result = motion_->Home();
-    std::scoped_lock lock(mutex_);
-    if (!result.success) {
-      error_message = "Home failed: " + result.error;
-      FailLocked(error_message);
-    } else {
-      state_.mode = "idle";
-    }
-    return state_;
+    // B8: run the move off the HTTP thread and return immediately. The UI polls
+    // /api/state and sees mode flip "manual" -> "idle" (or "fault") on completion.
+    if (old_move.joinable()) old_move.join();
+    move_worker_ = std::thread(&EdgeDaemon::ManualMoveWorker, this, 0.0, 0.0, true);
+    return GetSnapshot();
   }
 
   if (cmd == "jog") {
@@ -281,28 +312,37 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
     }
     double target_yaw;
     double target_pitch;
+    std::thread old_move;
     {
       std::scoped_lock lock(mutex_);
       if (scan_state_ != ScanState::Idle) {
         error_message = "Stop the current scan before jogging.";
         return state_;
       }
+      if (manual_move_active_) {
+        error_message = "A move is already in progress.";
+        return state_;
+      }
+      // B6: refuse to jog from an untrusted position (an aborted move left
+      // tracking stale). Friendly message + no fault latch — the operator just
+      // needs to re-home to re-establish the datum.
+      if (!motion_->yaw_position_known() || !motion_->pitch_position_known()) {
+        error_message = "Position unknown after an aborted move. Home the gantry before jogging.";
+        return state_;
+      }
       target_yaw   = motion_->yaw_deg();
       target_pitch = motion_->pitch_deg();
       if (request.axis == "yaw") target_yaw   += request.delta;
       else                       target_pitch += request.delta;
+      old_move = std::move(move_worker_);
+      manual_move_active_ = true;
       state_.mode = "manual";
       AddLogLocked("motion", "info", std::string("Jog ") + request.axis + ".");
     }
-    const auto result = motion_->MoveTo(target_yaw, target_pitch);
-    std::scoped_lock lock(mutex_);
-    if (!result.success) {
-      error_message = "Jog failed: " + result.error;
-      FailLocked(error_message);
-    } else {
-      state_.mode = "idle";
-    }
-    return state_;
+    // B8: offload to the move worker; return immediately (see "home" above).
+    if (old_move.joinable()) old_move.join();
+    move_worker_ = std::thread(&EdgeDaemon::ManualMoveWorker, this, target_yaw, target_pitch, false);
+    return GetSnapshot();
   }
 
   if (cmd == "start_scan") {
@@ -311,6 +351,18 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
       std::scoped_lock lock(mutex_);
       if (scan_state_ != ScanState::Idle) {
         error_message = "Stop the current scan before starting a new one.";
+        return state_;
+      }
+      // B8: a manual jog/home runs on the move worker; don't let a scan start
+      // driving motion while one is in flight.
+      if (manual_move_active_) {
+        error_message = "Wait for the current move to finish before scanning.";
+        return state_;
+      }
+      // B6: a scan is a long sequence of planned moves; refuse to start one from
+      // an untrusted position. The operator must re-home first.
+      if (!motion_->yaw_position_known() || !motion_->pitch_position_known()) {
+        error_message = "Position unknown after an aborted move. Home the gantry before scanning.";
         return state_;
       }
       // scan_state_ == Idle implies the worker (if any) has already exited;
@@ -380,7 +432,30 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
   return state_;
 }
 
+// B8: runs a single home/jog off the HTTP thread. The blocking MotionController
+// call (which drives the DMA waveform to completion or abort) happens here, not
+// on the request thread, so /api/state polling — and thus the safety heartbeat
+// — stays responsive throughout a multi-second move.
+void EdgeDaemon::ManualMoveWorker(double yaw_deg, double pitch_deg, bool is_home) {
+  const auto result = is_home ? motion_->Home() : motion_->MoveTo(yaw_deg, pitch_deg);
+
+  std::scoped_lock lock(mutex_);
+  manual_move_active_ = false;
+  // If an estop/fault landed while we were moving, it owns the state — don't
+  // clobber the "fault" mode or re-latch.
+  if (safety_->faulted()) return;
+  if (!result.success) {
+    FailLocked(std::string(is_home ? "Home" : "Jog") + " failed: " + result.error);
+  } else if (state_.mode == "manual") {
+    state_.mode = "idle";
+  }
+}
+
 void EdgeDaemon::ScanWorker() {
+  if (config_.scan.mode == "sweep") {
+    ScanWorkerSweep();
+    return;
+  }
   while (true) {
     int index = 0;
     int width = 0;
@@ -392,8 +467,8 @@ void EdgeDaemon::ScanWorker() {
       });
       if (scan_state_ == ScanState::Stopping) return;
 
-      width  = state_.grid.empty() ? 0 : static_cast<int>(state_.grid.front().size());
-      height = static_cast<int>(state_.grid.size());
+      width  = grid_w_;
+      height = grid_h_;
       if (width == 0 || height == 0) {
         scan_state_ = ScanState::Idle;
         state_.mode = "idle";
@@ -424,14 +499,32 @@ void EdgeDaemon::ScanWorker() {
       if (scan_state_ == ScanState::Paused) continue;  // don't capture; re-park on CV
     }
 
-    gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
-    const double distance = lidar_->ReadDistanceMeters(tgt_yaw, tgt_pitch);
+    // B11: a single noisy I²C read shouldn't discard the whole scan. Retry a
+    // few times (re-triggering and letting the bus settle between attempts)
+    // before latching a LidarFault. Sweep mode already tolerates dropped reads
+    // by skipping the cell; step mode used to latch on the very first NaN.
+    constexpr int kLidarReadAttempts = 3;
+    double distance = 0.0;
+    bool got_reading = false;
+    for (int attempt = 0; attempt < kLidarReadAttempts; ++attempt) {
+      if (attempt > 0) {
+        {
+          std::scoped_lock lock(mutex_);
+          if (scan_state_ == ScanState::Stopping) return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));  // let I²C settle
+      }
+      gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
+      distance = lidar_->ReadDistanceMeters(tgt_yaw, tgt_pitch);
+      if (!std::isnan(distance)) { got_reading = true; break; }
+    }
 
     std::scoped_lock lock(mutex_);
     if (scan_state_ == ScanState::Stopping) return;
 
-    if (std::isnan(distance)) {
-      FailLocked("Lidar read failed: " + lidar_->last_error());
+    if (!got_reading) {
+      FailLocked("Lidar read failed after " + std::to_string(kLidarReadAttempts) +
+                 " attempts: " + lidar_->last_error());
       safety_->TriggerFault(FaultCode::LidarFault, lidar_->last_error());
       scan_state_ = ScanState::Idle;
       return;
@@ -439,16 +532,133 @@ void EdgeDaemon::ScanWorker() {
 
     // Normalise to a 0..1 "surface confidence" band for the web UI heatmap.
     const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
-    state_.grid[y][x] = Round(normalised, 10000.0);
+    MarkCellLocked(x, y, Round(normalised, 10000.0));
     filled_cells_ = std::max(filled_cells_, index + 1);
     scan_index_ = index + 1;
 
     const int total = width * height;
     state_.coverage = Round(static_cast<double>(filled_cells_) / std::max(1, total), 10000.0);
     state_.scan_progress = state_.coverage;
-    UpdateMetricsLocked();
 
     if (scan_index_ >= total) {
+      FinishScanLocked("Scan complete. Surface model updated.");
+      scan_state_ = ScanState::Idle;
+      return;
+    }
+  }
+}
+
+void EdgeDaemon::ScanWorkerSweep() {
+  // Continuous scan: sweep yaw across each row at a constant, LIDAR-limited
+  // velocity while reading the sensor on the fly. The head only accelerates
+  // and decelerates once per row (at the ends), not once per cell — which is
+  // where stop-and-shoot scanning burns nearly all its time. Boustrophedon:
+  // even rows sweep min→max, odd rows max→min, so no inter-row repositioning.
+  const double mspd_yaw = config_.mechanics.yaw_microsteps_per_deg();
+
+  while (true) {
+    int width = 0, height = 0, row = 0;
+    double yaw_min = 0.0, yaw_max = 0.0;
+    bool forward = true;
+    {
+      std::unique_lock<std::mutex> lock(mutex_);
+      scan_cv_.wait(lock, [&] {
+        return scan_state_ == ScanState::Scanning || scan_state_ == ScanState::Stopping;
+      });
+      if (scan_state_ == ScanState::Stopping) return;
+
+      width  = grid_w_;
+      height = grid_h_;
+      if (width == 0 || height == 0) {
+        scan_state_ = ScanState::Idle;
+        state_.mode = "idle";
+        return;
+      }
+      row = scan_row_;
+      if (row >= height) {
+        FinishScanLocked("Scan complete. Surface model updated.");
+        scan_state_ = ScanState::Idle;
+        return;
+      }
+      yaw_min = state_.scan_settings.yaw_min;
+      yaw_max = state_.scan_settings.yaw_max;
+      forward = (row % 2 == 0);
+    }
+
+    const double tgt_pitch = TargetPitchForCell(row, height);
+    const double yaw_start = forward ? yaw_min : yaw_max;
+    const double yaw_end   = forward ? yaw_max : yaw_min;
+
+    // 1. Position the head at the row start + correct pitch (point-to-point).
+    const auto pre = motion_->MoveTo(yaw_start, tgt_pitch);
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ == ScanState::Stopping) return;
+      if (!pre.success) {
+        FailLocked("Scan positioning failed: " + pre.error);
+        safety_->TriggerFault(FaultCode::MotionAbort, pre.error);
+        scan_state_ = ScanState::Idle;
+        return;
+      }
+      if (scan_state_ == ScanState::Paused) continue;  // row not started; re-park on CV
+    }
+
+    // 2. LIDAR-limited sweep velocity: head advances at most ~one cell per
+    //    LIDAR sample period, capped by the motor's sweep ceiling.
+    const double cell_w = (yaw_max - yaw_min) / std::max(1, width - 1);
+    const double lidar_period_s = std::max(1, config_.scan.lidar_period_ms) / 1000.0;
+    const double v_sweep = std::min(config_.scan.sweep_max_speed_deg_s, cell_w / lidar_period_s);
+
+    // 3. Launch the continuous sweep.
+    std::string err;
+    if (!motion_->StartYawSweep(yaw_end, v_sweep, config_.scan.sweep_accel_deg_s2, err)) {
+      std::scoped_lock lock(mutex_);
+      FailLocked("Sweep start failed: " + err);
+      safety_->TriggerFault(FaultCode::MotionAbort, err);
+      scan_state_ = ScanState::Idle;
+      return;
+    }
+
+    // 4. Sample on the fly, binning each reading to a cell by head position.
+    bool aborted = false;
+    const double span = std::max(1e-9, yaw_max - yaw_min);
+    while (motion_->SweepBusy()) {
+      {
+        std::scoped_lock lock(mutex_);
+        if (scan_state_ == ScanState::Stopping) aborted = true;
+      }
+      if (aborted) { motion_->AbortMotion(); break; }
+
+      const long s0 = motion_->SweepMicrostepsTravelled();
+      const double yaw_pre = forward ? (yaw_start + s0 / mspd_yaw) : (yaw_start - s0 / mspd_yaw);
+      gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
+      const double distance = lidar_->ReadDistanceMeters(yaw_pre, tgt_pitch);
+      const long s1 = motion_->SweepMicrostepsTravelled();
+      if (std::isnan(distance)) continue;  // transient bad read: skip, keep sweeping
+
+      const double trav_deg = (static_cast<double>(s0 + s1) / 2.0) / mspd_yaw;
+      const double yaw_now = forward ? (yaw_start + trav_deg) : (yaw_start - trav_deg);
+      int x = static_cast<int>(std::lround((yaw_now - yaw_min) / span * (width - 1)));
+      if (x < 0) x = 0;
+      if (x >= width) x = width - 1;
+
+      const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ == ScanState::Stopping) { aborted = true; }
+      else { MarkCellLocked(x, row, Round(normalised, 10000.0)); }
+      if (aborted) { motion_->AbortMotion(); break; }
+    }
+
+    motion_->FinishYawSweep(!aborted);
+
+    std::scoped_lock lock(mutex_);
+    if (scan_state_ == ScanState::Stopping) return;
+    scan_row_ = row + 1;
+    filled_cells_ = scan_row_ * width;  // rows completed (per-cell gaps are cosmetic)
+    const int total = width * height;
+    state_.coverage = Round(static_cast<double>(filled_cells_) / std::max(1, total), 10000.0);
+    state_.scan_progress = state_.coverage;
+    if (scan_row_ >= height) {
       FinishScanLocked("Scan complete. Surface model updated.");
       scan_state_ = ScanState::Idle;
       return;
@@ -514,22 +724,82 @@ void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
 
   state_.scan_settings.resolution = preset;
   state_.scan_settings.sample_stride_microsteps = stride;
-  state_.grid.assign(static_cast<std::size_t>(height),
-                     std::vector<double>(static_cast<std::size_t>(width), -1.0));
+  RebuildGridLocked(static_cast<int>(width), static_cast<int>(height));
 
-  const double per_point_ms = 110.0;  // rough budget: move + settle + trigger + read
-  state_.scan_duration_seconds =
-      Round((static_cast<double>(width) * static_cast<double>(height) * per_point_ms) / 1000.0, 100.0);
+  double duration_s;
+  if (config_.scan.mode == "sweep") {
+    // Continuous: per-row time ≈ sweep duration + a fixed ramp/pitch-step budget.
+    const double cell_w = yaw_span / static_cast<double>(std::max(1L, width - 1));
+    const double lidar_period_s = std::max(1, config_.scan.lidar_period_ms) / 1000.0;
+    const double v = std::min(config_.scan.sweep_max_speed_deg_s, cell_w / lidar_period_s);
+    const double row_s = (v > 0.0 ? yaw_span / v : 0.0) + 0.4;
+    duration_s = row_s * static_cast<double>(height);
+  } else {
+    const double per_point_ms = 110.0;  // move + settle + trigger + read
+    duration_s = (static_cast<double>(width) * static_cast<double>(height) * per_point_ms) / 1000.0;
+  }
+  state_.scan_duration_seconds = Round(duration_s, 100.0);
   ResetScanLocked();
 }
 
 void EdgeDaemon::ResetScanLocked() {
-  for (auto& row : state_.grid) std::fill(row.begin(), row.end(), -1.0);
+  ClearGridLocked();  // wipe cells + bump generation so clients full-refresh to empty
   state_.coverage = 0.0;
   state_.scan_progress = 0.0;
   state_.last_completed_scan_at.reset();
   filled_cells_ = 0;
   scan_index_ = 0;
+  scan_row_ = 0;
+}
+
+void EdgeDaemon::RebuildGridLocked(int width, int height) {
+  grid_w_ = std::max(0, width);
+  grid_h_ = std::max(0, height);
+  grid_.assign(static_cast<std::size_t>(grid_h_),
+               std::vector<double>(static_cast<std::size_t>(grid_w_), -1.0));
+  cell_version_.assign(static_cast<std::size_t>(grid_w_) * static_cast<std::size_t>(grid_h_), 0);
+  ++grid_generation_;
+  grid_version_ = 0;
+}
+
+void EdgeDaemon::ClearGridLocked() {
+  for (auto& row : grid_) std::fill(row.begin(), row.end(), -1.0);
+  std::fill(cell_version_.begin(), cell_version_.end(), std::uint64_t{0});
+  ++grid_generation_;
+  grid_version_ = 0;
+}
+
+void EdgeDaemon::MarkCellLocked(int x, int y, double value) {
+  if (x < 0 || y < 0 || x >= grid_w_ || y >= grid_h_) return;
+  grid_[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)] = value;
+  cell_version_[static_cast<std::size_t>(y) * static_cast<std::size_t>(grid_w_) +
+                static_cast<std::size_t>(x)] = ++grid_version_;
+}
+
+GridUpdate EdgeDaemon::GetGridUpdate(std::uint64_t since_version,
+                                     std::uint64_t client_generation) const {
+  std::scoped_lock lock(mutex_);
+  GridUpdate gu;
+  gu.generation = grid_generation_;
+  gu.version = grid_version_;
+  gu.width = grid_w_;
+  gu.height = grid_h_;
+  // A stale client generation (fresh client, or post-resize/reset) ⇒ send every
+  // filled cell so it can rebuild; otherwise only cells changed since its version.
+  gu.full = (client_generation != grid_generation_);
+  for (int y = 0; y < grid_h_; ++y) {
+    for (int x = 0; x < grid_w_; ++x) {
+      const std::size_t i = static_cast<std::size_t>(y) * static_cast<std::size_t>(grid_w_) +
+                            static_cast<std::size_t>(x);
+      const double v = grid_[static_cast<std::size_t>(y)][static_cast<std::size_t>(x)];
+      if (v < 0.0) continue;  // unfilled cells aren't transmitted; clients default to -1
+      if (gu.full || cell_version_[i] > since_version) {
+        gu.idx.push_back(static_cast<int>(i));
+        gu.val.push_back(v);
+      }
+    }
+  }
+  return gu;
 }
 
 void EdgeDaemon::AddLogLocked(const std::string& source, const std::string& level,
@@ -537,16 +807,6 @@ void EdgeDaemon::AddLogLocked(const std::string& source, const std::string& leve
   state_.activity.insert(state_.activity.begin(),
                          ActivityEntry{source, CurrentTimestamp(), message, level});
   if (state_.activity.size() > 20) state_.activity.resize(20);
-}
-
-void EdgeDaemon::UpdateMetricsLocked() {
-  const bool scanning = state_.mode == "scanning";
-  const bool moving   = motion_->is_busy();
-  state_.metrics.motor_temp_c   = Round(31.0 + (scanning ? 4.0 : 0.8) + (moving ? 1.2 : 0.0), 10.0);
-  state_.metrics.motor_current_a = Round(moving ? 1.45 : 0.42, 100.0);
-  state_.metrics.lidar_fps      = scanning ? 12 : 0;
-  state_.metrics.radar_fps      = 0;
-  state_.metrics.latency_ms     = scanning ? 80 : 30;
 }
 
 void EdgeDaemon::FinishScanLocked(const std::string& message) {

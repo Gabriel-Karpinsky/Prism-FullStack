@@ -4,6 +4,16 @@ const state = {
   pollHandle: null,
   // Last motion config loaded from the server. Used by "Reset to loaded".
   loadedMotionConfig: null,
+  // Incremental scan grid. The grid is held client-side as a flat Float32Array
+  // (row-major); each poll sends ?since/&gen and the server returns only the
+  // cells that changed, which we paint individually instead of redrawing the
+  // whole canvas every 700 ms. gridGeneration tracks the server's grid identity
+  // (bumps on resolution change / scan reset → triggers a full rebuild).
+  grid: null,
+  gridW: 0,
+  gridH: 0,
+  gridGeneration: 0,
+  gridSince: 0,
 };
 
 const el = {
@@ -11,6 +21,7 @@ const el = {
   acquireBtn: document.getElementById("acquire-btn"),
   releaseBtn: document.getElementById("release-btn"),
   resolutionSelect: document.getElementById("resolution-select"),
+  scanModeSelect: document.getElementById("scan-mode-select"),
   commandStatus: document.getElementById("command-status"),
   controlOwner: document.getElementById("control-owner"),
   modeBadge: document.getElementById("mode-badge"),
@@ -18,14 +29,13 @@ const el = {
   pitchValue: document.getElementById("pitch-value"),
   coverageValue: document.getElementById("coverage-value"),
   progressValue: document.getElementById("progress-value"),
-  motorTempValue: document.getElementById("motor-temp-value"),
-  latencyValue: document.getElementById("latency-value"),
   progressFill: document.getElementById("progress-fill"),
   scanDurationValue: document.getElementById("scan-duration-value"),
   resolutionDetail: document.getElementById("resolution-detail"),
   faultBanner: document.getElementById("fault-banner"),
   activityLog: document.getElementById("activity-log"),
   mapCanvas: document.getElementById("surface-map"),
+  overlayCanvas: document.getElementById("surface-overlay"),
   // Motion config panel
   mcYawMin:    document.getElementById("mc-yaw-min"),
   mcYawMax:    document.getElementById("mc-yaw-max"),
@@ -41,6 +51,7 @@ const el = {
 };
 
 const ctx = el.mapCanvas.getContext("2d");
+const octx = el.overlayCanvas.getContext("2d");
 
 function getUser() {
   return el.userName.value.trim();
@@ -89,45 +100,89 @@ function colorForHeight(value) {
   return "rgb(240, 244, 245)";
 }
 
-function drawSurfaceMap(snapshot) {
-  const grid = snapshot.grid || [];
-  const rows = grid.length;
-  const cols = rows > 0 ? grid[0].length : 0;
-  const width = el.mapCanvas.width;
-  const height = el.mapCanvas.height;
-  const cellWidth = cols > 0 ? width / cols : width;
-  const cellHeight = rows > 0 ? height / rows : height;
+// The heatmap lives on #surface-map; the head marker lives on the #surface-overlay
+// canvas stacked on top. Keeping them separate means a poll repaints only the
+// handful of cells that changed (or just the marker), never the whole grid.
 
-  ctx.clearRect(0, 0, width, height);
+function paintCellByIndex(i) {
+  if (!state.grid || state.gridW === 0 || state.gridH === 0) return;
+  const x = i % state.gridW;
+  const y = Math.floor(i / state.gridW);
+  const cw = el.mapCanvas.width / state.gridW;
+  const ch = el.mapCanvas.height / state.gridH;
+  ctx.fillStyle = colorForHeight(state.grid[i]);
+  // +1 avoids hairline seams between cells at fractional sizes.
+  ctx.fillRect(x * cw, y * ch, cw + 1, ch + 1);
+}
+
+function repaintAllCells() {
+  const w = el.mapCanvas.width;
+  const h = el.mapCanvas.height;
+  ctx.clearRect(0, 0, w, h);
   ctx.fillStyle = "#0b252b";
-  ctx.fillRect(0, 0, width, height);
+  ctx.fillRect(0, 0, w, h);
+  if (!state.grid) return;
+  for (let i = 0; i < state.grid.length; i += 1) {
+    if (state.grid[i] < 0) continue; // unfilled cells show through to the background
+    paintCellByIndex(i);
+  }
+}
 
-  for (let y = 0; y < rows; y += 1) {
-    for (let x = 0; x < cols; x += 1) {
-      const value = grid[y][x];
-      ctx.fillStyle = colorForHeight(value);
-      ctx.fillRect(x * cellWidth, y * cellHeight, cellWidth + 1, cellHeight + 1);
-    }
+function drawMarker(snapshot) {
+  const w = el.overlayCanvas.width;
+  const h = el.overlayCanvas.height;
+  octx.clearRect(0, 0, w, h);
+  if (!snapshot || !snapshot.scanSettings) return;
+
+  const { yawMin, yawMax, pitchMin, pitchMax } = snapshot.scanSettings;
+  const markerX = ((snapshot.yaw - yawMin) / Math.max(1, yawMax - yawMin)) * w;
+  const markerY = ((snapshot.pitch - pitchMin) / Math.max(1, pitchMax - pitchMin)) * h;
+
+  octx.strokeStyle = "rgba(255,255,255,0.9)";
+  octx.lineWidth = 2;
+  octx.beginPath();
+  octx.arc(markerX, markerY, 7, 0, Math.PI * 2);
+  octx.stroke();
+
+  octx.fillStyle = "rgba(255,255,255,0.24)";
+  octx.beginPath();
+  octx.arc(markerX, markerY, 13, 0, Math.PI * 2);
+  octx.fill();
+}
+
+// Apply a GridUpdate from the server. Three cases:
+//   • new generation or size change → rebuild the local array, full repaint
+//   • full=true                     → clear + apply the provided cells, full repaint
+//   • delta                         → apply changed cells, repaint just those
+function applyGridUpdate(gu) {
+  if (!gu) return; // command/acquire/release responses carry no grid
+
+  const sizeChanged = gu.width !== state.gridW || gu.height !== state.gridH;
+  if (gu.generation !== state.gridGeneration || sizeChanged || !state.grid) {
+    state.gridGeneration = gu.generation;
+    state.gridW = gu.width;
+    state.gridH = gu.height;
+    state.grid = new Float32Array(gu.width * gu.height).fill(-1);
+    for (let k = 0; k < gu.idx.length; k += 1) state.grid[gu.idx[k]] = gu.val[k];
+    state.gridSince = gu.version;
+    repaintAllCells();
+    return;
   }
 
-  const yawMin = snapshot.scanSettings.yawMin;
-  const yawMax = snapshot.scanSettings.yawMax;
-  const pitchMin = snapshot.scanSettings.pitchMin;
-  const pitchMax = snapshot.scanSettings.pitchMax;
+  if (gu.full) {
+    state.grid.fill(-1);
+    for (let k = 0; k < gu.idx.length; k += 1) state.grid[gu.idx[k]] = gu.val[k];
+    state.gridSince = gu.version;
+    repaintAllCells();
+    return;
+  }
 
-  const markerX = ((snapshot.yaw - yawMin) / Math.max(1, yawMax - yawMin)) * width;
-  const markerY = ((snapshot.pitch - pitchMin) / Math.max(1, pitchMax - pitchMin)) * height;
-
-  ctx.strokeStyle = "rgba(255,255,255,0.9)";
-  ctx.lineWidth = 2;
-  ctx.beginPath();
-  ctx.arc(markerX, markerY, 7, 0, Math.PI * 2);
-  ctx.stroke();
-
-  ctx.fillStyle = "rgba(255,255,255,0.24)";
-  ctx.beginPath();
-  ctx.arc(markerX, markerY, 13, 0, Math.PI * 2);
-  ctx.fill();
+  for (let k = 0; k < gu.idx.length; k += 1) {
+    const i = gu.idx[k];
+    state.grid[i] = gu.val[k];
+    paintCellByIndex(i);
+  }
+  state.gridSince = gu.version;
 }
 
 function renderLog(activity = []) {
@@ -167,13 +222,18 @@ function formatDuration(seconds) {
 // and scan-time estimate fall out of that and the motion range. This caption
 // makes the real numbers visible so the preset choice isn't a black box.
 function renderScanDensity(snapshot) {
-  const grid = snapshot.grid || [];
-  const rows = grid.length;
-  const cols = rows > 0 ? grid[0].length : 0;
-  const stride = snapshot.scanSettings.sampleStrideMicrosteps || 0;
+  const cols = state.gridW;
+  const rows = state.gridH;
+  const ss = snapshot.scanSettings;
+  const stride = ss.sampleStrideMicrosteps || 0;
   let detail = `Scan grid: ${cols} × ${rows} samples`;
   if (stride > 0) {
     detail += ` · stride ${stride} µstep${stride === 1 ? "" : "s"}`;
+  }
+  if (ss.scanMode === "sweep") {
+    detail += ` · sweep ≤ ${Math.round(ss.sweepMaxSpeedDegS || 0)}°/s`;
+  } else if (ss.scanMode === "step") {
+    detail += " · step (stop & shoot)";
   }
   detail += ` · est. ${formatDuration(snapshot.scanDurationSeconds)}`;
   if (cols * rows > 250000) {
@@ -182,7 +242,11 @@ function renderScanDensity(snapshot) {
   el.resolutionDetail.textContent = detail;
 }
 
-function render(snapshot) {
+// renderState updates everything except the heatmap (text fields, faults, log,
+// scan-density caption, and the head marker). The heatmap is driven separately
+// by applyGridUpdate, so command/lease responses — which carry no grid — call
+// renderState only and leave the grid untouched.
+function renderState(snapshot) {
   state.snapshot = snapshot;
   el.controlOwner.textContent = snapshot.controlOwner || "Unclaimed";
   el.modeBadge.textContent = snapshot.mode;
@@ -190,11 +254,12 @@ function render(snapshot) {
   el.pitchValue.textContent = `${snapshot.pitch.toFixed(1)}°`;
   el.coverageValue.textContent = `${Math.round(snapshot.coverage * 100)}%`;
   el.progressValue.textContent = `${Math.round(snapshot.scanProgress * 100)}%`;
-  el.motorTempValue.textContent = `${snapshot.metrics.motorTempC.toFixed(1)} C`;
-  el.latencyValue.textContent = `${snapshot.metrics.latencyMs} ms`;
   el.progressFill.style.width = `${Math.round(snapshot.scanProgress * 100)}%`;
   el.scanDurationValue.textContent = `Estimated duration: ${formatDuration(snapshot.scanDurationSeconds)}`;
   el.resolutionSelect.value = snapshot.scanSettings.resolution;
+  if (snapshot.scanSettings.scanMode) {
+    el.scanModeSelect.value = snapshot.scanSettings.scanMode;
+  }
   renderScanDensity(snapshot);
 
   if (snapshot.faults && snapshot.faults.length > 0) {
@@ -206,13 +271,16 @@ function render(snapshot) {
   }
 
   renderLog(snapshot.activity);
-  drawSurfaceMap(snapshot);
+  drawMarker(snapshot);
 }
 
 async function pollState() {
   try {
-    const snapshot = await request("/api/state", { method: "GET" });
-    render(snapshot);
+    // Send our grid cursor so the server can reply with only changed cells.
+    const url = `/api/state?since=${state.gridSince}&gen=${state.gridGeneration}`;
+    const snapshot = await request(url, { method: "GET" });
+    applyGridUpdate(snapshot.gridUpdate); // sets gridW/gridH before renderState reads them
+    renderState(snapshot);
     if (!state.lastMessage || state.lastMessage === "Loading scanner state...") {
       setStatus("Scanner state synchronized.");
     }
@@ -233,7 +301,7 @@ async function acquireControl() {
       method: "POST",
       body: JSON.stringify({ user }),
     });
-    render(response.state);
+    renderState(response.state);
     setStatus(`Control acquired by ${user}.`);
   } catch (error) {
     setStatus(error.message, true);
@@ -252,7 +320,7 @@ async function releaseControl() {
       method: "POST",
       body: JSON.stringify({ user }),
     });
-    render(response.state);
+    renderState(response.state);
     setStatus(`Control released by ${user}.`);
   } catch (error) {
     setStatus(error.message, true);
@@ -271,7 +339,7 @@ async function sendCommand(command, payload = {}) {
       method: "POST",
       body: JSON.stringify({ user, command, payload }),
     });
-    render(response.state);
+    renderState(response.state);
     setStatus(`Command '${command}' sent.`);
   } catch (error) {
     setStatus(error.message, true);
@@ -386,6 +454,10 @@ document.querySelectorAll("[data-jog-axis]").forEach((button) => {
 
 el.resolutionSelect.addEventListener("change", () => {
   sendCommand("set_resolution", { resolution: el.resolutionSelect.value });
+});
+
+el.scanModeSelect.addEventListener("change", () => {
+  sendCommand("set_scan_mode", { mode: el.scanModeSelect.value });
 });
 
 pollState();

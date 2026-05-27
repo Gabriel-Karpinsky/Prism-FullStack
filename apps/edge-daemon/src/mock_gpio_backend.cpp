@@ -32,8 +32,18 @@ class MockGpioBackend final : public IGpioBackend {
     return true;
   }
 
-  bool IsMotionBusy() const override { return false; }
-  void AbortMotion() override {}
+  // Non-blocking sweep: report "busy" for the plan's wall-clock duration so a
+  // continuous-scan sampling loop behaves like it would against real hardware.
+  bool StartMotionWaveform(const WaveformPlan& plan, std::string&) override {
+    last_plan_pulses_ = plan.pulses.size();
+    const std::uint32_t dur_us = plan.pulses.empty() ? 0u : plan.pulses.back().time_us;
+    sweep_end_ = std::chrono::steady_clock::now() + std::chrono::microseconds(dur_us);
+    return true;
+  }
+  void FinishMotionWaveform() override { sweep_end_ = std::chrono::steady_clock::now(); }
+
+  bool IsMotionBusy() const override { return std::chrono::steady_clock::now() < sweep_end_; }
+  void AbortMotion() override { sweep_end_ = std::chrono::steady_clock::now(); }
   void PulseTrigger(std::uint32_t) override { ++trigger_count_; }
   const char* Name() const override { return "mock-gpio"; }
 
@@ -47,6 +57,7 @@ class MockGpioBackend final : public IGpioBackend {
   std::atomic<int> last_plan_yaw_steps_{0};
   std::atomic<int> last_plan_pitch_steps_{0};
   std::atomic<std::uint32_t> trigger_count_{0};
+  std::chrono::steady_clock::time_point sweep_end_{};  // mock sweep "busy until"
 };
 
 }  // namespace

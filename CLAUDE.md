@@ -92,12 +92,15 @@ Done on `streamline-claude` / `master`:
   **B3** motion-config Apply button, **B7** `fmt.Errorf` — all fixed.
 - Resolution model reworked to hardware-grounded presets.
 
-On the **`continous_scan`** branch (NOT yet merged — needs bench validation at speed):
+Merged from **`continous_scan`** into `streamline-claude` → `master` (2026-05-28).
+**⚠ Not yet bench-validated on real hardware** — merged at the operator's request;
+still needs a real-Pi `HAS_PIGPIO=1` build, a browser smoke of the new rendering
+path, and a cautious first sweep (start with low `sweep_max_speed_deg_s` /
+`sweep_accel_deg_s2`):
 - Continuous sweep scanning (`scan.mode=sweep`, default). Verified via WSL mock build +
-  runtime smoke (scan ran to completion, no faults). Needs a real-Pi `HAS_PIGPIO=1`
-  build and a cautious first run (start with low `sweep_max_speed_deg_s`/`sweep_accel_deg_s2`).
-- Note: this branch makes `IGpioBackend::IsMotionBusy()` **load-bearing** (the sweep loop
-  polls it). Do not "remove as dead" once merged.
+  runtime smoke (scan ran to completion, no faults).
+- Note: `IGpioBackend::IsMotionBusy()` is **load-bearing** (the sweep loop polls it).
+  Do not "remove as dead".
 - **Bug fixes (2026-05-28):** B4 (Content-Length crash), B5 (request-body cap + Go server
   timeouts), B6 (`position_known` now blocks moves; `home` re-zeros), B8 (`home`/`jog` run
   on an async move worker), B9 (400 vs 409), B11 (3× LIDAR read retry in step mode). B10
@@ -107,8 +110,7 @@ On the **`continous_scan`** branch (NOT yet merged — needs bench validation at
   marker overlay canvas); fabricated telemetry removed (`Metrics` is now an empty
   placeholder; `radarFps`/`packetsDropped` gone); `json.Marshal` instead of `MarshalIndent`;
   sweep/step toggle in the UI via a new `set_scan_mode` command.
-- All validated via WSL mock builds + `go build`/`vet` + runtime mock smokes. **Still
-  needs a real-Pi `HAS_PIGPIO=1` build and a browser run before merge.** See
+- All validated via WSL mock builds + `go build`/`vet` + runtime mock smokes. See
   `docs/code-review.md` §7–§8 for the full status and review findings.
 
 ## Future direction / backlog

@@ -42,9 +42,29 @@ using json = nlohmann::json;
 
 struct Request {
   std::string method;
-  std::string path;
+  std::string path;   // path only; query string stripped off into `query`
+  std::string query;  // raw query string after '?', e.g. "since=12&gen=3"
   std::string body;
 };
+
+// Pulls an unsigned integer query parameter. Returns false if absent (lets the
+// state handler decide whether to attach a grid delta at all).
+bool TryQueryParam(const std::string& query, const std::string& key, std::uint64_t& out) {
+  std::size_t pos = 0;
+  while (pos <= query.size()) {
+    const auto amp = query.find('&', pos);
+    const auto len = (amp == std::string::npos) ? std::string::npos : amp - pos;
+    const std::string pair = query.substr(pos, len);
+    const auto eq = pair.find('=');
+    if (eq != std::string::npos && pair.substr(0, eq) == key) {
+      try { out = std::stoull(pair.substr(eq + 1)); return true; }
+      catch (const std::exception&) { return false; }
+    }
+    if (amp == std::string::npos) break;
+    pos = amp + 1;
+  }
+  return false;
+}
 
 json AxisToJson(const AxisMotion& a) {
   return json{
@@ -98,24 +118,31 @@ json SnapshotToJson(const Snapshot& s) {
           {"sweepSpeedDegPerSec",   s.scan_settings.sweep_speed_deg_per_sec},
           {"resolution",            s.scan_settings.resolution},
           {"sampleStrideMicrosteps", s.scan_settings.sample_stride_microsteps},
+          {"scanMode",              s.scan_settings.scan_mode},
+          {"sweepMaxSpeedDegS",     s.scan_settings.sweep_max_speed_deg_s},
       }},
-      {"metrics", {
-          {"motorTempC",     s.metrics.motor_temp_c},
-          {"motorCurrentA",  s.metrics.motor_current_a},
-          {"lidarFps",       s.metrics.lidar_fps},
-          {"radarFps",       s.metrics.radar_fps},
-          {"latencyMs",      s.metrics.latency_ms},
-          {"packetsDropped", s.metrics.packets_dropped},
-      }},
+      // Telemetry placeholder — the fabricated motor/lidar metrics were removed.
+      {"metrics", json::object()},
       {"faults", s.faults},
       {"activity", activity},
-      {"grid", s.grid},
   };
   root["lastCompletedScanAt"]   = s.last_completed_scan_at.has_value()
                                       ? json(*s.last_completed_scan_at) : json(nullptr);
   root["controlLeaseExpiresAt"] = s.control_lease_expires_at.has_value()
                                       ? json(*s.control_lease_expires_at) : json(nullptr);
   return root;
+}
+
+json GridUpdateToJson(const GridUpdate& g) {
+  return json{
+      {"generation", g.generation},
+      {"version",    g.version},
+      {"width",      g.width},
+      {"height",     g.height},
+      {"full",       g.full},
+      {"idx",        g.idx},
+      {"val",        g.val},
+  };
 }
 
 Request ParseRequest(const std::string& raw) {
@@ -125,6 +152,13 @@ Request ParseRequest(const std::string& raw) {
 
   std::istringstream line_stream(raw.substr(0, line_end));
   line_stream >> req.method >> req.path;
+
+  // Split the query string off the path so routing stays exact-match.
+  const auto qpos = req.path.find('?');
+  if (qpos != std::string::npos) {
+    req.query = req.path.substr(qpos + 1);
+    req.path  = req.path.substr(0, qpos);
+  }
 
   const auto header_end = raw.find("\r\n\r\n");
   if (header_end != std::string::npos) req.body = raw.substr(header_end + 4);
@@ -197,8 +231,14 @@ int HttpServer::Run() {
       ::setsockopt(client_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     }
 
+    // Control payloads are tiny (a command object, a motion-config block). Cap
+    // the total request we'll buffer so a client can't drive the daemon to OOM
+    // (B5): either by advertising a huge Content-Length or by streaming forever.
+    constexpr std::size_t kMaxRequestBytes = 1u << 20;  // 1 MiB
+
     std::string raw;
     char buffer[4096];
+    bool reject_too_large = false;
     while (!shutdown_.load()) {
       const ssize_t n = ::recv(client_fd, buffer, sizeof(buffer), 0);
       if (n < 0) {
@@ -207,14 +247,36 @@ int HttpServer::Run() {
       }
       if (n == 0) break;  // client closed cleanly
       raw.append(buffer, static_cast<std::size_t>(n));
+      if (raw.size() > kMaxRequestBytes) { reject_too_large = true; break; }  // B5: bound bytes received
       const auto hend = raw.find("\r\n\r\n");
       if (hend == std::string::npos) continue;
       std::smatch m;
       std::regex cl_re("Content-Length:\\s*([0-9]+)", std::regex_constants::icase);
       std::size_t expected = 0;
       const std::string headers = raw.substr(0, hend);
-      if (std::regex_search(headers, m, cl_re)) expected = std::stoul(m[1].str());
+      if (std::regex_search(headers, m, cl_re)) {
+        // B4: a malformed or oversized Content-Length must not throw out of the
+        // recv loop. std::stoul on a value past ULONG_MAX throws std::out_of_range,
+        // and this runs *before* the request-handling try block below — an uncaught
+        // throw here would call std::terminate and kill the daemon. Any client on
+        // the tailnet could trigger it with one crafted header. Parse defensively.
+        try {
+          expected = static_cast<std::size_t>(std::stoull(m[1].str()));
+        } catch (const std::exception&) {
+          reject_too_large = true;  // unparseable length: refuse rather than crash
+          break;
+        }
+        if (expected > kMaxRequestBytes) { reject_too_large = true; break; }  // B5
+      }
       if (raw.size() >= hend + 4 + expected) break;
+    }
+
+    if (reject_too_large) {
+      const std::string response = MakeResponse(
+          413, "Payload Too Large", json{{"error", "request too large"}}.dump());
+      ::send(client_fd, response.data(), response.size(), MSG_NOSIGNAL);
+      ::close(client_fd);
+      continue;
     }
 
     const Request req = ParseRequest(raw);
@@ -227,7 +289,17 @@ int HttpServer::Run() {
         body = json{{"ok", true}}.dump();
 
       } else if (req.method == "GET" && req.path == "/api/hardware/state") {
-        body = SnapshotToJson(daemon_.GetSnapshot()).dump();
+        json root = SnapshotToJson(daemon_.GetSnapshot());
+        // Attach the incremental grid only when the client asks for it (?since=).
+        // Plain /api/hardware/state (no query) — e.g. the Go command-path sync —
+        // omits the grid entirely so command responses stay tiny.
+        std::uint64_t since = 0;
+        if (TryQueryParam(req.query, "since", since)) {
+          std::uint64_t gen = 0;
+          TryQueryParam(req.query, "gen", gen);
+          root["gridUpdate"] = GridUpdateToJson(daemon_.GetGridUpdate(since, gen));
+        }
+        body = root.dump();
 
       } else if (req.method == "POST" && req.path == "/api/hardware/command") {
         CommandRequest command;
@@ -236,6 +308,7 @@ int HttpServer::Run() {
         command.axis       = payload.value("axis",       std::string{});
         command.delta      = payload.value("delta",      0.0);
         command.resolution = payload.value("resolution", std::string{});
+        command.mode       = payload.value("mode",       std::string{});
 
         std::string err;
         const Snapshot snap = daemon_.ExecuteCommand(command, err);

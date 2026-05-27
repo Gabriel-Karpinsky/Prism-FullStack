@@ -15,16 +15,15 @@ type ScanSettings struct {
 	SweepSpeedDegPerSec    float64 `json:"sweepSpeedDegPerSec"`
 	Resolution             string  `json:"resolution"`
 	SampleStrideMicrosteps int     `json:"sampleStrideMicrosteps"`
+	ScanMode               string  `json:"scanMode"`           // "sweep" | "step"
+	SweepMaxSpeedDegS      float64 `json:"sweepMaxSpeedDegS"`  // configured sweep ceiling
 }
 
-type Metrics struct {
-	MotorTempC     float64 `json:"motorTempC"`
-	MotorCurrentA  float64 `json:"motorCurrentA"`
-	LidarFPS       int     `json:"lidarFps"`
-	RadarFPS       int     `json:"radarFps"`
-	LatencyMS      int     `json:"latencyMs"`
-	PacketsDropped int     `json:"packetsDropped"`
-}
+// Metrics is a placeholder for future real sensor telemetry. The fields that
+// used to live here (motor temp/current, lidar/radar fps, latency, packets
+// dropped) were fabricated values shown as if measured, and have been removed.
+// Kept as an empty struct so the wire schema can grow without another break.
+type Metrics struct{}
 
 // AxisMotion mirrors the edge-daemon's per-axis motion envelope. Keys are
 // snake_case to match the wire format the daemon ships on /api/config/motion.
@@ -43,6 +42,21 @@ type MotionConfig struct {
 	Pitch AxisMotion `json:"pitch"`
 }
 
+// GridUpdate is the incremental scan-grid payload. The client holds the grid
+// locally and applies deltas: idx/val are parallel arrays (idx = row-major cell
+// index y*Width+x, val = normalised 0..1 height). Full means "rebuild from these
+// cells" (sent when the client's generation is stale, e.g. after a resolution
+// change or scan reset, which bump Generation). See the daemon's GetGridUpdate.
+type GridUpdate struct {
+	Generation uint64    `json:"generation"`
+	Version    uint64    `json:"version"`
+	Width      int       `json:"width"`
+	Height     int       `json:"height"`
+	Full       bool      `json:"full"`
+	Idx        []int     `json:"idx"`
+	Val        []float64 `json:"val"`
+}
+
 type Snapshot struct {
 	Connected             bool            `json:"connected"`
 	Mode                  string          `json:"mode"`
@@ -58,5 +72,8 @@ type Snapshot struct {
 	Metrics               Metrics         `json:"metrics"`
 	Faults                []string        `json:"faults"`
 	Activity              []ActivityEntry `json:"activity"`
-	Grid                  [][]float64     `json:"grid"`
+	// GridUpdate is only populated on the polled /api/state path (when the client
+	// sends ?since=). Command/acquire/release responses leave it nil so they stay
+	// small; the UI refreshes the grid from the poll loop.
+	GridUpdate *GridUpdate `json:"gridUpdate,omitempty"`
 }

@@ -318,12 +318,36 @@ microsteps_per_deg = (full_steps_per_rev × microsteps × gear_ratio) / 360
 
 So at `200 × 128 × 1.0 / 360 ≈ 71.11` microsteps per degree.
 
+### Scan mode (`scan.*`)
+
+Continuous-scan parameters, all under a `scan` block in `hardware.json`:
+
+```json
+"scan": {
+  "mode": "sweep",
+  "sweep_max_speed_deg_s": 120.0,
+  "sweep_accel_deg_s2": 800.0,
+  "lidar_period_ms": 30
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `mode` | `sweep` (continuous, default) or `step` (stop-and-shoot). |
+| `sweep_max_speed_deg_s` | Motor speed ceiling for sweeps. The actual sweep speed is the lower of this and the LIDAR-limited speed (`cell_width ÷ lidar_period`). |
+| `sweep_accel_deg_s2` | Ramp rate at row ends. The gantry is light, so this is aggressive (800 °/s²) — lower it if you see ringing or missed steps. |
+| `lidar_period_ms` | Assumed time per LIDAR reading. Sweep speed is capped so the head moves ≤ ~1 cell per period. Raise it if cells come out sparse (the LIDAR is slower than assumed); lower it to sweep faster. |
+
+In `sweep` mode the head sweeps each row continuously while sampling, instead
+of stopping at every cell — typically 5–20× faster. See
+[`data-flow.md`](./data-flow.md) §6. `scan.*` changes require a daemon restart.
+
 ### What is hot-swappable vs restart-required
 
 | Field group | Change applies |
 |---|---|
 | `motion.*` (limits, speed, accel) | **Hot** — `PUT /api/config/motion`, persisted to disk |
-| `mechanics.*`, `gpio.*`, `safety.*`, `lidar.*`, `service.*` | Requires `sudo systemctl restart cliffscanner-edge` |
+| `mechanics.*`, `gpio.*`, `safety.*`, `lidar.*`, `service.*`, `scan.*` | Requires `sudo systemctl restart cliffscanner-edge` |
 
 Hot-swap example:
 

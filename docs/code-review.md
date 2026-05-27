@@ -1,8 +1,11 @@
 # Cliff Face Scanner — Codebase Review
 
-> Status: review snapshot, 2026-05-18. A point-in-time audit of correctness,
-> error handling, performance, and dead code. File/line references are accurate
-> as of this date; verify against current `HEAD` before acting.
+> Status: review snapshot, 2026-05-18; **updated 2026-05-28** after the
+> `continous_scan` work landed B4/B5/B6/B8/B9/B11 and the online-rendering
+> rework (incremental grid, telemetry removal, sweep/step toggle). A
+> point-in-time audit of correctness, error handling, performance, and dead
+> code. Original file/line references are as of 2026-05-18 — verify against
+> current `HEAD` before acting. Findings from the 2026-05-28 cycle are in §8.
 
 This document explains how the system works internally, then evaluates it for
 correctness bugs, error handling, performance, and unused code, and ends with a
@@ -140,29 +143,29 @@ still works).
 
 ### High
 
-**B4 — Uncaught exception in the HTTP request parser crashes the daemon.** In
-`HttpServer::Run`, `std::stoul(m[1].str())` (`http_server.cpp:215`) parses
-`Content-Length`. A malformed/huge value throws `std::out_of_range` or
-`std::invalid_argument`. This line sits in the recv loop **before** the `try`
-block at line 224 — the exception is uncaught, `std::terminate` runs, the
-daemon dies. Any client on the tailnet can crash it with one request.
-**Fix:** wrap the parse, clamp the value.
+**B4 — Uncaught exception in the HTTP request parser crashes the daemon.**
+✅ **Fixed (`continous_scan`, `289fc99`).** `std::stoul` on `Content-Length` ran
+in the recv loop *before* the request `try` block, so a malformed/huge value
+threw uncaught → `std::terminate`. Any tailnet client could crash the daemon
+with one header. **Fix applied:** the parse is now `std::stoull` wrapped in
+`try`/`catch`; an unparseable/oversized value is rejected with HTTP 413 instead
+of crashing.
 
-**B5 — No request-body cap → memory-exhaustion DoS.** The recv loop appends
-into `raw` with no upper bound (`http_server.cpp:208`). A client advertising
-`Content-Length: 9999999999` makes the daemon allocate until OOM. The Go server
-is similar — `http.ListenAndServe` with a default `http.Server` has **no
-`ReadTimeout`/`WriteTimeout`** (`main.go:160`), so it's open to slowloris.
+**B5 — No request-body cap → memory-exhaustion DoS.** ✅ **Fixed
+(`continous_scan`, `289fc99`).** The daemon recv loop now bounds buffered bytes
+at 1 MiB and rejects an oversized/unparseable `Content-Length` with 413. The Go
+server replaced bare `http.ListenAndServe` with an explicit `&http.Server{...}`
+carrying `ReadHeaderTimeout`/`ReadTimeout`/`WriteTimeout`/`IdleTimeout` +
+`MaxHeaderBytes`, and bodies are wrapped in `http.MaxBytesReader` — closing both
+the slowloris and the unbounded-read holes.
 
-**B6 — `MarkPositionUnknown` is a decorative safety mechanism.** On an aborted
-waveform, `MotionController::MoveTo` calls `yaw_.MarkPositionUnknown()`
-(`motion_controller.cpp:105`) — but the motor *did* move partway, and
-`current_microsteps_` was never updated (only `Commit` updates it). So the
-tracked position is now wrong. `position_known_` records this... and **nothing
-ever reads it**. The next `MoveTo` plans from the stale position and silently
-drives to the wrong place. **Fix:** after an abort, force the operator to
-re-home before any further move; have `PlanMove`/`ExecuteCommand` refuse moves
-while `!position_known()`.
+**B6 — `MarkPositionUnknown` is a decorative safety mechanism.** ✅ **Fixed
+(`continous_scan`, `289fc99`).** `MotionController::MoveTo` now refuses to plan
+while either axis reports `!position_known()` (the tracked position is stale
+after an aborted move). `Home()` is the recovery path: with no endstops it
+*declares* the current pose as zero (`StepperAxis::ResetToZero`) rather than
+driving to a stale target, restoring tracking. `jog`/`start_scan` fail fast with
+a "re-home" message and no fault latch.
 
 **B7 — `fmt.Errorf` with a non-constant format string.** ✅ **Fixed.**
 `client.go` passed daemon-supplied error text straight into `fmt.Errorf` as the
@@ -171,28 +174,29 @@ applied:** both call sites now use `errors.New(...)`; `go vet` is clean.
 
 ### Medium
 
-**B8 — Single-threaded daemon: a long move blocks all polling.** `home` and
-`jog` call `MotionController::MoveTo` *synchronously inside `ExecuteCommand`*,
-which runs on the daemon's only HTTP thread. A multi-second home blocks
-`/api/hardware/state` for its whole duration. The Go client times out at 5 s
-(`client.go:36`) → any move longer than 5 s returns an error to the UI even
-though the move is fine. (`start_scan` is correctly offloaded to a worker; only
-the manual moves block.)
+**B8 — Single-threaded daemon: a long move blocks all polling.** ✅ **Fixed
+(`continous_scan`, `2d64f0a`).** `home`/`jog` now run on a dedicated move worker
+(mirroring `start_scan`) and return immediately with `mode:"manual"`; the UI
+polls `/api/state` for the `idle`/`fault` transition. This also removes a latent
+hazard — a multi-second synchronous home blocked polling *and* the safety
+heartbeat, risking a spurious `host_watchdog` fault. Added scan↔move mutual
+exclusion; `estop`/`Stop()` now abort and reap an in-flight manual move (estop
+previously didn't even `AbortMotion`).
 
-**B9 — Malformed JSON returns HTTP 409.** `decodeJSON` failures in
-`/api/control/*` and `/api/command` are written as `409 Conflict`
-(`main.go:79`, etc.) — a parse error is `400 Bad Request`. 409 is for lease
-conflicts. This conflates client-error categories and confuses the UI.
+**B9 — Malformed JSON returns HTTP 409.** ✅ **Fixed (`continous_scan`,
+`289fc99`).** Decode failures on `/api/control/acquire`,`/release`,`/api/command`
+now return `400 Bad Request`; `409 Conflict` is reserved for genuine lease
+conflicts.
 
-**B10 — No authentication anywhere.** The "lease" is just a username string;
-there is no token. On a Tailscale network that is *probably* acceptable, but
-this is a machine that physically moves — it should be a conscious decision,
-not an accident.
+**B10 — No authentication anywhere.** ⏸ **Deferred (decision pending).** The
+"lease" is still just a username string with no token. On a Tailscale network
+that is *probably* acceptable, but it should be a conscious, documented
+decision. Left open intentionally; revisit before any non-tailnet exposure.
 
-**B11 — Transient I²C glitch kills the whole scan.** `ReadDistanceMeters`
-returns `NaN` on any I²C error; the scan worker immediately `FailLocked` +
-`TriggerFault(LidarFault)` and latches (`edge_daemon.cpp:426-431`). One noisy
-read on cell 900 of 1152 throws away the whole scan. No retry.
+**B11 — Transient I²C glitch kills the whole scan.** ✅ **Fixed
+(`continous_scan`, `2d64f0a`).** Step-mode reads now retry up to 3× (re-trigger
++ short settle) before latching `LidarFault`. Sweep mode already tolerated
+dropped reads by skipping the cell.
 
 ## 3. Error-handling evaluation & strategy
 
@@ -216,20 +220,24 @@ Weaknesses:
 
 **Strategy (priority order):**
 
-1. **Harden the daemon's HTTP intake** — wrap Content-Length parsing, cap the
-   body (e.g. 64 KiB), add a hard deadline for the whole request.
-2. **Add Go server timeouts** — replace `http.ListenAndServe` with an explicit
-   `&http.Server{ReadHeaderTimeout, ReadTimeout, WriteTimeout, IdleTimeout}`.
-3. **Classify errors as transient vs terminal.** Give I²C reads and
-   `WriteRegister`/`ReadRegister` a small bounded retry (3×, ~5 ms apart)
-   before declaring `NaN`. Only latch `LidarFault` after retries exhaust. Same
-   for a single failed move.
-4. **Make `position_known` load-bearing** (B6) — refuse moves on an axis with
-   unknown position; require `home` to clear it.
-5. **Fix the error-status taxonomy** — 400 for malformed input, 409 only for
-   lease conflicts, 502/503 for edge-daemon unreachable.
-6. **Introduce structured logging** with levels; keep the in-memory ring for
-   the UI but also write to stderr/journald in a parseable format.
+1. ✅ **Harden the daemon's HTTP intake** (B4/B5) — Content-Length parse is
+   wrapped + clamped; body capped at 1 MiB with a 413 reject. *(Open nuance: a
+   client that sends headers then dribbles still relies on the 1 s `SO_RCVTIMEO`
+   loop rather than a single whole-request deadline — acceptable, not a hard
+   deadline.)*
+2. ✅ **Add Go server timeouts** (B5) — explicit `&http.Server{ReadHeaderTimeout,
+   ReadTimeout, WriteTimeout, IdleTimeout, MaxHeaderBytes}` + `MaxBytesReader`.
+3. ◑ **Classify errors as transient vs terminal.** *Partial:* step-mode LIDAR
+   reads now retry 3× before latching (B11). Still worth extending to a single
+   failed move and to the I²C register helpers.
+4. ✅ **Make `position_known` load-bearing** (B6) — moves refused on an axis with
+   unknown position; `home` re-establishes the datum.
+5. ✅ **Fix the error-status taxonomy** (B9) — 400 for malformed input, 409 only
+   for lease conflicts; edge-daemon-unreachable already surfaces as a fault via
+   `decorateSnapshotLocked`.
+6. **Introduce structured logging** with levels — *still open*; keep the
+   in-memory ring for the UI but also write to stderr/journald parseably.
+   (`EdgeService.lastError` is still set-but-never-read — fold into this.)
 
 ## 4. Performance evaluation & strategy
 
@@ -250,30 +258,31 @@ is clear waste:
 
 **Strategy:**
 
-1. **Stop shipping the grid on every poll.** Add a grid version/generation
-   counter; the UI sends `?since=N` and gets `{unchanged:true}` or just the
-   changed cells. Biggest single win — cuts payload ~95% for the common case.
-2. **Drop `MarshalIndent`** → `json.Marshal`. Pretty output belongs in a debug
-   endpoint only.
-3. **Split the daemon's slow path off the HTTP thread**, or give the daemon a
-   tiny thread pool (2–4 threads). `home`/`jog` should return immediately with
-   a "moving" state and let the UI poll for completion, as `start_scan`
-   already does.
+1. ✅ **Stop shipping the grid on every poll.** *Done (`86a7eb2`).* Grid moved
+   out of `Snapshot`; the client holds it as a `Float32Array` and polls
+   `/api/state?since=<version>&gen=<generation>`, receiving a compact
+   `gridUpdate` (changed cells only, or all filled cells when the generation is
+   stale). Steady-state idle polls now ship zero cells. See §8 for a note on the
+   O(N) server-side scan.
+2. ✅ **Drop `MarshalIndent`** → `json.Marshal`. *Done (`8658444`).*
+3. ✅ **Split the daemon's slow path off the HTTP thread.** *Done (B8,
+   `2d64f0a`).* `home`/`jog` return immediately and run on a move worker.
 4. **Consider Server-Sent Events** instead of 700 ms polling — the daemon
-   pushes a snapshot when state changes. Removes idle traffic entirely.
-   (Bigger change; do after #1.)
-5. Minor: redraw only changed cells in `drawSurfaceMap`.
+   pushes a snapshot when state changes. Removes idle traffic entirely. Still
+   open; the incremental endpoint (#1) is the prerequisite and is now in place.
+5. ✅ **Redraw only changed cells.** *Done (`86a7eb2`).* The heatmap repaints
+   only delta cells; the head marker moved to a stacked overlay canvas.
 
 ## 5. Dead / unused / vestigial code
 
 | Item | Location | Verdict |
 |---|---|---|
 | `proto/scanner/v1/scanner.proto` | gRPC `ScannerControlService` contract | **Fully dead.** Nothing generates or uses it; the system runs JSON. Delete or move to a `docs/future/` folder. |
-| `radarFps` / `radar_fps` | `Metrics` in `types.go:23`, `types.hpp:29`, wire JSON | There is no radar. Vestigial; the edge daemon hardcodes it to `0`. Remove from the schema. |
-| `packetsDropped` | `Metrics` | Always `0`, never computed. Remove or implement. |
-| Fabricated metrics | `EdgeDaemon::UpdateMetricsLocked` (`edge_daemon.cpp:505`) | `motor_temp_c`, `motor_current_a`, `lidar_fps`, `latency_ms` are **made-up numbers**, even on real hardware. The UI displays them as if sensor readings. Either wire real telemetry or label them as estimates. Actively misleading. |
-| `IGpioBackend::IsMotionBusy()` | interface + both backends | `MotionController` tracks its own `busy_` atomic and never calls `gpio_->IsMotionBusy()`. Redundant. |
-| `SetStatusLed` / `status_led` | backends, config | Defined, configured, never called. |
+| `radarFps` / `radar_fps` | `Metrics` | ✅ **Removed (`8658444`)** with the telemetry struct. |
+| `packetsDropped` | `Metrics` | ✅ **Removed (`8658444`)** with the telemetry struct. |
+| Fabricated metrics | `EdgeDaemon::UpdateMetricsLocked` | ✅ **Removed (`8658444`).** `UpdateMetricsLocked` + the sim's `updateMetricsLocked`/`round1` are gone; `Metrics` is now an empty placeholder struct (`{}` on the wire). The misleading motor temp/current, lidar/radar fps and latency values no longer exist. |
+| `IGpioBackend::IsMotionBusy()` | interface + both backends | ⚠️ **No longer dead — now load-bearing.** The continuous-sweep loop polls it via `MotionController::SweepBusy()` to detect waveform completion. **Do not remove.** (Note: `MotionController::is_busy()` — the separate atomic — is still used by the safety supervisor.) |
+| `SetStatusLed` / `status_led` | backends, config | Defined, configured, never called. *Still open.* |
 | `tick_interval_ms`, `status_broadcast_interval_ms` | `ServiceConfig`, loaded from JSON | Parsed and stored, never read. |
 | `EdgeService.lastError` | `edge_service.go:24` | Set in three places, read nowhere. |
 | The `Service` simulator | `service.go` (~570 lines) | *Not* dead — it is the dev/demo backend. But it is a **parallel reimplementation** of the daemon's scan logic that will drift (its grid is hardcoded `48×24`; the daemon resizes by resolution; `set_resolution` rules differ). Keep it, but treat it as a known sync-drift liability. |
@@ -297,19 +306,53 @@ it before this repo is shared widely.
 ## 7. Action plan (priority order)
 
 **Done:** B1 (watchdog), B2 (waveform chaining), B3 (Apply button), B7
-(`fmt.Errorf`). Remaining:
+(`fmt.Errorf`); **and on `continous_scan`:** B4, B5, B6, B8, B9, B11, plus
+Performance #1/#2/#3/#5 (incremental grid, compact JSON, off-thread moves,
+dirty-cell redraw) and the telemetry removal. All validated via WSL mock builds
++ `go build`/`vet` + runtime mock smokes; **pending a real-Pi `HAS_PIGPIO=1`
+build, a browser run, and merge to `streamline-claude` → `master`.**
+
+Remaining:
 
 1. **`git rm -r --cached .gocache`** — 30 seconds, removes 100 MB of noise.
-2. **B4 + B5** — harden the daemon's HTTP parser; add Go server timeouts. The
-   daemon currently crashes on a malformed request.
-3. **B6** — make `position_known` actually block moves. A *physical safety* gap
-   on a machine with motors.
-4. **B9** — return HTTP 400 (not 409) for malformed request bodies.
-5. **B8 + B11** — offload blocking moves; add bounded I²C retries.
-6. **Performance #1** — stop shipping the full grid on every poll.
-7. **Delete dead code** (§5) — `proto/`, `radarFps`, `packetsDropped`, dead
-   config fields.
-8. **Add tests.** There is currently **zero test coverage** in any of the
-   three languages. At minimum: unit-test `GenerateStepTimes` (the trapezoidal
-   profile — pure, math-heavy, easy to test, and a bug there moves the motor
-   wrong), the lease state machine, and `CoordForIndex` boustrophedon logic.
+2. **B10** — decide on auth (token vs. documented tailnet-only). Deferred.
+3. **Performance #4 — Server-Sent Events** (optional) now that the incremental
+   endpoint exists: push snapshots instead of 700 ms polling.
+4. **Delete remaining dead code** (§5) — `proto/`, `SetStatusLed`/`status_led`,
+   `tick_interval_ms`/`status_broadcast_interval_ms`, `EdgeService.lastError`.
+5. **Add tests.** Still **zero test coverage**. At minimum: `GenerateStepTimes`
+   (trapezoidal profile — pure, math-heavy), the lease state machine,
+   `CoordForIndex` boustrophedon, the resolution→stride→grid derivation, and
+   now **`GetGridUpdate` / `buildGridUpdateLocked`** delta logic (generation
+   bump → full; version cursor → delta; unfilled cells skipped).
+
+## 8. Review cycle 2026-05-28 — the `continous_scan` changes
+
+A self-review of the five commits that landed B4/B5/B6/B8/B9/B11 and the
+online-rendering rework. **No critical or high-severity new issues.** The async
+move worker (B8) was scrutinised for concurrency: the daemon's HTTP server is
+single-threaded so command handlers never race each other; worker↔HTTP state is
+mediated by `mutex_`; there is no lock inversion (a worker never holds
+`MotionController`'s lock while waiting on `EdgeDaemon::mutex_`); and
+`estop`/`Stop()` abort + join the worker. The incremental-grid protocol falls
+back to a full refresh correctly on generation change and keeps command
+responses grid-free.
+
+Minor / informational findings:
+
+| # | Area | Finding | Severity |
+|---|------|---------|----------|
+| 1 | Performance | `GetGridUpdate` (and the sim's `buildGridUpdateLocked`) scan the **entire** grid O(W×H) every poll to find changed cells — there is no dirty-set. Serialization/transport/redraw are now O(changed), but the server-side find is O(N). Fine under the 300k-cell clamp (sub-millisecond); revisit if the clamp is ever raised much higher. | 🟢 Low |
+| 2 | Consistency | A poll takes **two separate `mutex_` acquisitions** (`GetSnapshot` then `GetGridUpdate`), so position and grid can come from instants microseconds apart. Irrelevant for a UI; noted for completeness. | 🟢 Low |
+| 3 | Lock hold | On a full refresh (generation change only — resolution change / scan start) the daemon builds two up-to-300k-element vectors while holding `mutex_`, briefly blocking the scan worker and allocating ~3.6 MB. Rare and acceptable. | 🟢 Low |
+| 4 | Maintainability | The `if (gu.full)` branch in the UI's `applyGridUpdate` is effectively unreachable: the daemon/sim only set `full` on a generation mismatch, which the *first* branch already handles. Harmless defensive code; could be dropped or kept as a guard. | 🟢 Low |
+| 5 | Sim drift | `set_scan_mode` updates the sim's displayed mode but the sim's duration estimate stays step-based (`gridW*gridH*0.11`) regardless of mode — so the sim shows a step-time estimate even in sweep mode. Extends the known sim/daemon drift liability (§5); the real daemon re-derives the estimate correctly. | 🟢 Low |
+
+**What looks good:** targeted, well-commented fixes; the incremental-grid design
+(generation + monotonic version + parallel `idx`/`val`) is clean and the
+command/poll split keeps command responses small; telemetry removal is complete
+with no stray references; every tier builds and vets clean and the runtime mock
+smokes pass.
+
+**Verdict:** Approve for merge **after** the real-Pi `HAS_PIGPIO=1` build and a
+browser smoke of the new rendering path.

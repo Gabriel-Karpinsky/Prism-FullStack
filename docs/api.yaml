@@ -89,6 +89,16 @@ components:
         sampleStrideMicrosteps:
           type: integer
           description: Microsteps the head advances between samples (derived from the preset).
+        scanMode:
+          type: string
+          enum: [sweep, step]
+          description: >
+            Scan motion mode. "sweep" sweeps each row continuously while sampling
+            on the fly (faster, LIDAR-limited); "step" stops at each cell to shoot.
+        sweepMaxSpeedDegS:
+          type: number
+          format: double
+          description: Configured sweep velocity ceiling (deg/s); informational.
         yawMin:
           type: number
           format: double
@@ -104,14 +114,48 @@ components:
 
     Metrics:
       type: object
+      description: |
+        Placeholder for future real sensor telemetry. Previously carried
+        fabricated motor temp/current, lidar/radar fps and latency values shown
+        as if measured; those were removed. Currently always an empty object.
+      properties: {}
+
+    GridUpdate:
+      type: object
+      description: |
+        Incremental scan-grid update. The client holds the grid locally and
+        applies deltas. `idx`/`val` are parallel arrays: `idx` is the row-major
+        cell index (y*width + x), `val` the normalised height in [0, 1]. `full`
+        is true when the client must rebuild (its `generation` was stale — e.g.
+        after a resolution change or scan reset). Only present on `/api/state`
+        responses that include a `?since=` query.
       properties:
-        motorTempC:
-          type: number
-          format: double
-          description: Estimated motor temperature (°C) — currently placeholder.
-        latencyMs:
+        generation:
           type: integer
-          description: Round-trip latency between control-api and edge daemon (ms).
+          format: int64
+          description: Grid identity; changes on resize/reset.
+        version:
+          type: integer
+          format: int64
+          description: Monotonic change counter (resets on generation bump).
+        width:
+          type: integer
+        height:
+          type: integer
+        full:
+          type: boolean
+          description: True ⇒ rebuild the local grid from idx/val.
+        idx:
+          type: array
+          items:
+            type: integer
+          description: Changed cell indices (row-major, y*width + x).
+        val:
+          type: array
+          items:
+            type: number
+            format: double
+          description: Normalised heights [0, 1], parallel to idx.
 
     ActivityEntry:
       type: object
@@ -176,16 +220,15 @@ components:
           items:
             $ref: "#/components/schemas/ActivityEntry"
           description: Recent log entries, newest first.
-        grid:
-          type: array
-          items:
-            type: array
-            items:
-              type: number
-              format: double
+        gridUpdate:
+          allOf:
+            - $ref: "#/components/schemas/GridUpdate"
+          nullable: true
           description: |
-            2-D height-map grid. Each cell is a normalised value in [0, 1]
-            (or -1 if not yet measured). Row 0 is the lowest pitch row.
+            Incremental scan-grid delta. Present only on polled `/api/state`
+            requests that send a `?since=<version>&gen=<generation>` cursor;
+            omitted on command/lease responses. The full grid is no longer
+            shipped inline — the client reconstructs it from these deltas.
 
     ErrorResponse:
       type: object
@@ -200,6 +243,7 @@ components:
         Optional parameters for specific commands:
         - `jog`: `{ axis: "yaw"|"pitch", delta: <degrees> }`
         - `set_resolution`: `{ resolution: "coarse"|"standard"|"fine"|"max" }`
+        - `set_scan_mode`: `{ mode: "sweep"|"step" }`
         All other commands ignore the payload.
       additionalProperties: true
 
@@ -233,8 +277,25 @@ paths:
       summary: Poll scanner state
       description: |
         Returns the latest cached Snapshot. The web UI calls this every 700 ms.
-        Does not require a control lease — any observer can poll.
+        Does not require a control lease — any observer can poll. Pass the
+        incremental-grid cursor (`since`/`gen`) to receive only changed cells in
+        `gridUpdate`; omit both for state without a grid.
       operationId: controlapi.getState
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Client's last grid `version`. 0 (or stale `gen`) ⇒ full grid.
+        - name: gen
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Client's last grid `generation`. A mismatch forces a full grid.
       responses:
         "200":
           description: Current scanner snapshot.
