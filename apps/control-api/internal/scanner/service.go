@@ -65,6 +65,8 @@ func NewService() *Service {
 				PitchMax:            35,
 				SweepSpeedDegPerSec: 20,
 				Resolution:          "standard",
+				ScanMode:            "sweep", // matches the edge daemon default
+				SweepMaxSpeedDegS:   120,
 			},
 			faults:   []string{},
 			activity: []ActivityEntry{},
@@ -285,6 +287,16 @@ func (s *Service) Command(user, command string, payload map[string]any) (Snapsho
 		}
 		s.applyResolutionLocked(resolution)
 		s.addLog("scanner", "info", "Scan resolution set to "+resolution+".")
+	case "set_scan_mode":
+		mode := strings.ToLower(strings.TrimSpace(stringFromMap(payload, "mode")))
+		if mode != "sweep" && mode != "step" {
+			return Snapshot{}, errors.New("scan mode must be sweep or step")
+		}
+		if s.state.mode == "scanning" || s.state.mode == "paused" {
+			return Snapshot{}, errors.New("stop the current scan before changing scan mode")
+		}
+		s.state.scanSettings.ScanMode = mode
+		s.addLog("scanner", "info", "Scan mode set to "+mode+".")
 	case "start_scan":
 		if !s.state.connected {
 			return Snapshot{}, errors.New("scanner is not connected")

@@ -118,6 +118,8 @@ json SnapshotToJson(const Snapshot& s) {
           {"sweepSpeedDegPerSec",   s.scan_settings.sweep_speed_deg_per_sec},
           {"resolution",            s.scan_settings.resolution},
           {"sampleStrideMicrosteps", s.scan_settings.sample_stride_microsteps},
+          {"scanMode",              s.scan_settings.scan_mode},
+          {"sweepMaxSpeedDegS",     s.scan_settings.sweep_max_speed_deg_s},
       }},
       // Telemetry placeholder — the fabricated motor/lidar metrics were removed.
       {"metrics", json::object()},
@@ -306,6 +308,7 @@ int HttpServer::Run() {
         command.axis       = payload.value("axis",       std::string{});
         command.delta      = payload.value("delta",      0.0);
         command.resolution = payload.value("resolution", std::string{});
+        command.mode       = payload.value("mode",       std::string{});
 
         std::string err;
         const Snapshot snap = daemon_.ExecuteCommand(command, err);

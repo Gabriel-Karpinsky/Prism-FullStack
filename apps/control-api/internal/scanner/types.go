@@ -15,6 +15,8 @@ type ScanSettings struct {
 	SweepSpeedDegPerSec    float64 `json:"sweepSpeedDegPerSec"`
 	Resolution             string  `json:"resolution"`
 	SampleStrideMicrosteps int     `json:"sampleStrideMicrosteps"`
+	ScanMode               string  `json:"scanMode"`           // "sweep" | "step"
+	SweepMaxSpeedDegS      float64 `json:"sweepMaxSpeedDegS"`  // configured sweep ceiling
 }
 
 // Metrics is a placeholder for future real sensor telemetry. The fields that

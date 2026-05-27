@@ -89,6 +89,16 @@ components:
         sampleStrideMicrosteps:
           type: integer
           description: Microsteps the head advances between samples (derived from the preset).
+        scanMode:
+          type: string
+          enum: [sweep, step]
+          description: >
+            Scan motion mode. "sweep" sweeps each row continuously while sampling
+            on the fly (faster, LIDAR-limited); "step" stops at each cell to shoot.
+        sweepMaxSpeedDegS:
+          type: number
+          format: double
+          description: Configured sweep velocity ceiling (deg/s); informational.
         yawMin:
           type: number
           format: double
@@ -233,6 +243,7 @@ components:
         Optional parameters for specific commands:
         - `jog`: `{ axis: "yaw"|"pitch", delta: <degrees> }`
         - `set_resolution`: `{ resolution: "coarse"|"standard"|"fine"|"max" }`
+        - `set_scan_mode`: `{ mode: "sweep"|"step" }`
         All other commands ignore the payload.
       additionalProperties: true
 
@@ -266,8 +277,25 @@ paths:
       summary: Poll scanner state
       description: |
         Returns the latest cached Snapshot. The web UI calls this every 700 ms.
-        Does not require a control lease — any observer can poll.
+        Does not require a control lease — any observer can poll. Pass the
+        incremental-grid cursor (`since`/`gen`) to receive only changed cells in
+        `gridUpdate`; omit both for state without a grid.
       operationId: controlapi.getState
+      parameters:
+        - name: since
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Client's last grid `version`. 0 (or stale `gen`) ⇒ full grid.
+        - name: gen
+          in: query
+          required: false
+          schema:
+            type: integer
+            format: int64
+          description: Client's last grid `generation`. A mismatch forces a full grid.
       responses:
         "200":
           description: Current scanner snapshot.

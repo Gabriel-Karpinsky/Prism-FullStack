@@ -65,6 +65,8 @@ EdgeDaemon::EdgeDaemon(Config config) : config_(std::move(config)) {
   state_.scan_settings.pitch_max = config_.motion.pitch.max_deg;
   state_.scan_settings.sweep_speed_deg_per_sec =
       std::min(config_.motion.yaw.max_speed_deg_s, config_.motion.pitch.max_speed_deg_s);
+  state_.scan_settings.scan_mode = config_.scan.mode;
+  state_.scan_settings.sweep_max_speed_deg_s = config_.scan.sweep_max_speed_deg_s;
 
   ApplyResolutionLocked(state_.scan_settings.resolution);
   ResetScanLocked();
@@ -256,6 +258,25 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
     ApplyResolutionLocked(request.resolution.empty() ? state_.scan_settings.resolution
                                                      : request.resolution);
     AddLogLocked("scanner", "info", "Scan resolution set to " + state_.scan_settings.resolution + ".");
+    return state_;
+  }
+
+  if (cmd == "set_scan_mode") {
+    std::scoped_lock lock(mutex_);
+    if (scan_state_ != ScanState::Idle) {
+      error_message = "Stop the current scan before changing scan mode.";
+      return state_;
+    }
+    if (request.mode != "sweep" && request.mode != "step") {
+      error_message = "Scan mode must be 'sweep' or 'step'.";
+      return state_;
+    }
+    config_.scan.mode = request.mode;
+    state_.scan_settings.scan_mode = request.mode;
+    // Re-derive the grid + duration estimate (sweep vs step time very differently)
+    // and reset the pending scan for the new mode.
+    ApplyResolutionLocked(state_.scan_settings.resolution);
+    AddLogLocked("scanner", "info", "Scan mode set to " + request.mode + ".");
     return state_;
   }
 

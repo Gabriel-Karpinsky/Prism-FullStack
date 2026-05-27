@@ -21,6 +21,7 @@ const el = {
   acquireBtn: document.getElementById("acquire-btn"),
   releaseBtn: document.getElementById("release-btn"),
   resolutionSelect: document.getElementById("resolution-select"),
+  scanModeSelect: document.getElementById("scan-mode-select"),
   commandStatus: document.getElementById("command-status"),
   controlOwner: document.getElementById("control-owner"),
   modeBadge: document.getElementById("mode-badge"),
@@ -223,10 +224,16 @@ function formatDuration(seconds) {
 function renderScanDensity(snapshot) {
   const cols = state.gridW;
   const rows = state.gridH;
-  const stride = snapshot.scanSettings.sampleStrideMicrosteps || 0;
+  const ss = snapshot.scanSettings;
+  const stride = ss.sampleStrideMicrosteps || 0;
   let detail = `Scan grid: ${cols} × ${rows} samples`;
   if (stride > 0) {
     detail += ` · stride ${stride} µstep${stride === 1 ? "" : "s"}`;
+  }
+  if (ss.scanMode === "sweep") {
+    detail += ` · sweep ≤ ${Math.round(ss.sweepMaxSpeedDegS || 0)}°/s`;
+  } else if (ss.scanMode === "step") {
+    detail += " · step (stop & shoot)";
   }
   detail += ` · est. ${formatDuration(snapshot.scanDurationSeconds)}`;
   if (cols * rows > 250000) {
@@ -250,6 +257,9 @@ function renderState(snapshot) {
   el.progressFill.style.width = `${Math.round(snapshot.scanProgress * 100)}%`;
   el.scanDurationValue.textContent = `Estimated duration: ${formatDuration(snapshot.scanDurationSeconds)}`;
   el.resolutionSelect.value = snapshot.scanSettings.resolution;
+  if (snapshot.scanSettings.scanMode) {
+    el.scanModeSelect.value = snapshot.scanSettings.scanMode;
+  }
   renderScanDensity(snapshot);
 
   if (snapshot.faults && snapshot.faults.length > 0) {
@@ -444,6 +454,10 @@ document.querySelectorAll("[data-jog-axis]").forEach((button) => {
 
 el.resolutionSelect.addEventListener("change", () => {
   sendCommand("set_resolution", { resolution: el.resolutionSelect.value });
+});
+
+el.scanModeSelect.addEventListener("change", () => {
+  sendCommand("set_scan_mode", { mode: el.scanModeSelect.value });
 });
 
 pollState();

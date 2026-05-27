@@ -25,6 +25,12 @@ struct ScanSettings {
   std::string resolution = "standard";
   // Microsteps the head advances between samples; derived from the preset.
   int sample_stride_microsteps = 0;
+  // Scan motion mode: "sweep" (continuous) or "step" (stop-and-shoot). Mirrors
+  // config_.scan.mode; surfaced so the UI can show + toggle it.
+  std::string scan_mode = "sweep";
+  // Configured sweep velocity ceiling (deg/s); informational for the UI. The
+  // actual sweep speed is min(this, cell_width / lidar_period).
+  double sweep_max_speed_deg_s = 120.0;
 };
 
 // Placeholder for future real sensor telemetry (e.g. measured motor current,
@@ -75,6 +81,7 @@ struct CommandRequest {
   std::string axis;
   double delta = 0.0;
   std::string resolution;
+  std::string mode;  // for set_scan_mode: "sweep" | "step"
 };
 
 }  // namespace edge
