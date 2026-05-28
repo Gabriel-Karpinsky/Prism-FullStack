@@ -49,6 +49,12 @@ class MotionController {
 
   double yaw_deg() const;
   double pitch_deg() const;
+  // Live (mid-sweep) yaw position. Outside a sweep this equals yaw_deg(); during
+  // a sweep, yaw_deg() returns the last *committed* position (only updated at
+  // sweep end), so the UI telemetry would stick at the row start/end value.
+  // live_yaw_deg() interpolates against the sweep's trapezoidal time profile so
+  // the displayed yaw tracks the head in real time.
+  double live_yaw_deg() const;
   double target_yaw_deg() const;
   double target_pitch_deg() const;
   bool yaw_position_known() const;

@@ -55,6 +55,13 @@ struct Snapshot {
   Metrics metrics;
   std::vector<std::string> faults;
   std::vector<ActivityEntry> activity;
+  // Result of the most recent single-point distance measurement (the UI's
+  // "Measure" button). -1.0 = no measurement taken yet. Always carries the
+  // distance in metres so the operator sees a real, human-readable value.
+  double last_distance_m = -1.0;
+  double last_distance_at_yaw = 0.0;
+  double last_distance_at_pitch = 0.0;
+  std::optional<std::string> last_distance_taken_at;
   // The scan grid is no longer carried in the Snapshot — it can be hundreds of
   // thousands of cells. It's fetched incrementally via GridUpdate (see below)
   // so a poll only ships the cells that changed since the client's last version.

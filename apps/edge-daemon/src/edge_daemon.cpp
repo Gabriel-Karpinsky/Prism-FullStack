@@ -20,8 +20,10 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -45,7 +47,6 @@ std::string CurrentTimestamp() {
   return out.str();
 }
 
-double Clamp(double v, double lo, double hi) { return std::max(lo, std::min(v, hi)); }
 double Round(double v, double scale)         { return std::round(v * scale) / scale; }
 
 }  // namespace
@@ -134,8 +135,11 @@ Snapshot EdgeDaemon::GetSnapshot() const {
 
   std::scoped_lock lock(mutex_);
   Snapshot s = state_;
-  s.yaw   = Round(motion_->yaw_deg(),   100.0);
-  s.pitch = Round(motion_->pitch_deg(), 100.0);
+  // live_yaw_deg() interpolates against the sweep profile during continuous
+  // scans so the displayed yaw tracks the head in real time; without this it
+  // would stick at the row's committed start/end value the whole sweep.
+  s.yaw   = Round(motion_->live_yaw_deg(), 100.0);
+  s.pitch = Round(motion_->pitch_deg(),    100.0);
 
   const FaultCode code = safety_->fault_code();
   if (code != FaultCode::None) {
@@ -277,6 +281,48 @@ Snapshot EdgeDaemon::ExecuteCommand(const CommandRequest& request, std::string& 
     // and reset the pending scan for the new mode.
     ApplyResolutionLocked(state_.scan_settings.resolution);
     AddLogLocked("scanner", "info", "Scan mode set to " + request.mode + ".");
+    return state_;
+  }
+
+  if (cmd == "single_distance") {
+    // Take one measurement at the current head position and surface the value
+    // in metres. Useful for calibrating the distance range and for spot-checks.
+    {
+      std::scoped_lock lock(mutex_);
+      if (scan_state_ != ScanState::Idle) {
+        error_message = "Stop the current scan before measuring.";
+        return state_;
+      }
+      if (manual_move_active_) {
+        error_message = "Wait for the current move to finish before measuring.";
+        return state_;
+      }
+    }
+    // Lock released for the LIDAR read (see lock discipline note at the top).
+    const double yaw   = motion_->yaw_deg();
+    const double pitch = motion_->pitch_deg();
+    constexpr int kAttempts = 3;
+    double distance_m = std::numeric_limits<double>::quiet_NaN();
+    for (int attempt = 0; attempt < kAttempts; ++attempt) {
+      if (attempt > 0) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+      gpio_->PulseTrigger(static_cast<std::uint32_t>(config_.safety.lidar_trigger_pulse_us));
+      distance_m = lidar_->ReadDistanceMeters(yaw, pitch);
+      if (!std::isnan(distance_m)) break;
+    }
+    std::scoped_lock lock(mutex_);
+    if (std::isnan(distance_m)) {
+      error_message = "Lidar read failed: " + lidar_->last_error();
+      return state_;
+    }
+    state_.last_distance_m = Round(distance_m, 100.0);  // 1 cm precision
+    state_.last_distance_at_yaw   = Round(yaw,   100.0);
+    state_.last_distance_at_pitch = Round(pitch, 100.0);
+    state_.last_distance_taken_at = CurrentTimestamp();
+    char buf[96];
+    std::snprintf(buf, sizeof(buf),
+                  "Single distance: %.2f m at yaw=%.2f, pitch=%.2f",
+                  distance_m, yaw, pitch);
+    AddLogLocked("sensor", "info", buf);
     return state_;
   }
 
@@ -531,8 +577,10 @@ void EdgeDaemon::ScanWorker() {
     }
 
     // Normalise to a 0..1 "surface confidence" band for the web UI heatmap.
-    const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
-    MarkCellLocked(x, y, Round(normalised, 10000.0));
+    // Store the raw distance in metres. The UI maps to colour via a
+    // user-settable [min, max] range so the heatmap means something concrete
+    // (instead of an opaque 0..1 normalised value). 1 cm precision.
+    MarkCellLocked(x, y, Round(distance, 100.0));
     filled_cells_ = std::max(filled_cells_, index + 1);
     scan_index_ = index + 1;
 
@@ -642,10 +690,11 @@ void EdgeDaemon::ScanWorkerSweep() {
       if (x < 0) x = 0;
       if (x >= width) x = width - 1;
 
-      const double normalised = Clamp((6.4 - distance) / 2.8, 0.0, 1.0);
+      // Store raw distance in metres (1 cm precision); UI maps to colour.
+      const double distance_m = Round(distance, 100.0);
       std::scoped_lock lock(mutex_);
       if (scan_state_ == ScanState::Stopping) { aborted = true; }
-      else { MarkCellLocked(x, row, Round(normalised, 10000.0)); }
+      else { MarkCellLocked(x, row, distance_m); }
       if (aborted) { motion_->AbortMotion(); break; }
     }
 
@@ -697,12 +746,16 @@ void EdgeDaemon::ApplyResolutionLocked(const std::string& resolution) {
   // Resolution presets are grounded in hardware: the scan head advances a
   // fixed number of microsteps between samples. "max" samples every single
   // microstep (the finest the driver can resolve); coarser presets stride by
-  // whole motor steps.
+  // whole motor steps. The intermediate "half"/"quarter" presets give the
+  // operator usable density on driver/torque setups where 1 full step is too
+  // sparse but 1/8 step doesn't have torque to move continuously.
   int stride;
-  if      (preset == "max")    stride = 1;
-  else if (preset == "fine")   stride = std::max(1, ms / 8);
-  else if (preset == "coarse") stride = std::max(1, ms * 4);
-  else                         stride = ms;  // "standard" (and anything else) = 1 full step
+  if      (preset == "max")     stride = 1;
+  else if (preset == "fine")    stride = std::max(1, ms / 8);
+  else if (preset == "quarter") stride = std::max(1, ms / 4);
+  else if (preset == "half")    stride = std::max(1, ms / 2);
+  else if (preset == "coarse")  stride = std::max(1, ms * 4);
+  else                          stride = ms;  // "standard" (and anything else) = 1 full step
 
   // Grid dimensions fall out of the scan range, microstep density and stride.
   const double yaw_span   = std::max(0.0, state_.scan_settings.yaw_max   - state_.scan_settings.yaw_min);

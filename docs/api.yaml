@@ -80,12 +80,12 @@ components:
       properties:
         resolution:
           type: string
-          enum: [coarse, standard, fine, max]
+          enum: [coarse, standard, half, quarter, fine, max]
           description: >
             Scan-density preset. Each maps to a sampling stride in microsteps:
-            max = 1 (every microstep), fine = ⅛ full step, standard = 1 full
-            step, coarse = 4 full steps. The grid dimensions are derived from
-            this stride and the motion range.
+            max = 1 (every microstep), fine = ⅛ full step, quarter = ¼ step,
+            half = ½ step, standard = 1 full step, coarse = 4 full steps. The
+            grid dimensions are derived from this stride and the motion range.
         sampleStrideMicrosteps:
           type: integer
           description: Microsteps the head advances between samples (derived from the preset).

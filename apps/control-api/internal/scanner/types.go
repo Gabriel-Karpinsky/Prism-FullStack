@@ -72,6 +72,12 @@ type Snapshot struct {
 	Metrics               Metrics         `json:"metrics"`
 	Faults                []string        `json:"faults"`
 	Activity              []ActivityEntry `json:"activity"`
+	// Single-point distance from the UI "Measure" button (in metres);
+	// -1 ⇒ no reading taken yet. *At* fields record the head pose at capture.
+	LastDistanceM       float64 `json:"lastDistanceM"`
+	LastDistanceAtYaw   float64 `json:"lastDistanceAtYaw"`
+	LastDistanceAtPitch float64 `json:"lastDistanceAtPitch"`
+	LastDistanceTakenAt *string `json:"lastDistanceTakenAt"`
 	// GridUpdate is only populated on the polled /api/state path (when the client
 	// sends ?since=). Command/acquire/release responses leave it nil so they stay
 	// small; the UI refreshes the grid from the poll loop.
