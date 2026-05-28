@@ -9,6 +9,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdio>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -138,19 +139,40 @@ class PigpioGpioBackend final : public IGpioBackend {
     // boundary already carries the gap to the next chunk.
     gpioWaveClear();
     std::vector<int> wave_ids;
-    for (std::size_t off = 0; off < pulses.size(); off += kWaveMaxPulses) {
+    const std::size_t total_pulses = pulses.size();
+    for (std::size_t off = 0; off < total_pulses; off += kWaveMaxPulses) {
       const unsigned n = static_cast<unsigned>(
-          std::min<std::size_t>(kWaveMaxPulses, pulses.size() - off));
+          std::min<std::size_t>(kWaveMaxPulses, total_pulses - off));
       if (gpioWaveAddGeneric(n, pulses.data() + off) < 0 ||
           wave_ids.size() >= kMaxWaveChunks) {
         for (int id : wave_ids) gpioWaveDelete(id);
-        error = "move too large for pigpio wave memory; reduce travel distance";
+        char buf[192];
+        std::snprintf(buf, sizeof(buf),
+                      "waveform too large: %zu pulses (move/sweep needs more pigpio "
+                      "wave memory than is available); narrow the scan range or use "
+                      "step mode", total_pulses);
+        error = buf;
         return false;
       }
       const int id = gpioWaveCreate();
       if (id < 0) {
+        // The CB pool is exhausted across all currently-loaded chunks. For a
+        // sweep this means the whole row exceeds pigpio's DMA control-block
+        // budget (~25k CBs ≈ ~12k gpioPulse_t loaded simultaneously). A full
+        // ±50° row at microsteps=128 is ~14k pulses → ~28k CBs and hits this.
+        // Workaround until the sweep loop is segmented: shrink yaw_min/yaw_max
+        // (narrower envelope) or drop to step mode for the full envelope.
         for (int existing : wave_ids) gpioWaveDelete(existing);
-        error = "gpioWaveCreate failed (out of pigpio wave memory)";
+        char buf[256];
+        std::snprintf(buf, sizeof(buf),
+                      "gpioWaveCreate failed at chunk %zu of %zu (out of pigpio "
+                      "wave memory: this sweep needs %zu pulses; the DMA CB pool "
+                      "can hold ~12k loaded simultaneously). Narrow yaw_min/yaw_max "
+                      "or use scan.mode=\"step\".",
+                      wave_ids.size() + 1,
+                      (total_pulses + kWaveMaxPulses - 1) / kWaveMaxPulses,
+                      total_pulses);
+        error = buf;
         return false;
       }
       wave_ids.push_back(id);

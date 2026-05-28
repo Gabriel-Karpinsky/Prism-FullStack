@@ -129,13 +129,17 @@ bool GarminLidarLiteV3HPSensor::WaitForReady() {
   // it has signal. Garmin's reference Arduino library caps with a 10 000-
   // iteration counter (≈500 ms at 100 kHz). 500 ms matches that intent.
   //
-  // Status register layout (0x01):
-  //   bit 0 = system busy        ← we wait for this to clear
-  //   bit 1 = signal not valid   ← treat as "measurement complete but no return"
-  //   bit 2 = reference overflow
-  //   bit 3 = signal overflow
-  //   bit 4 = system failure     ← treat as hard fault
-  //   bit 6 = process done
+  // Status register layout (0x01) per the Garmin LIDAR-Lite v3HP datasheet.
+  // (The earlier comment block here mislabelled several bits — corrected.)
+  //   bit 0 = busy                ← we wait for this to clear
+  //   bit 1 = reference data overflow
+  //   bit 2 = signal data overflow
+  //   bit 3 = signal not valid    (measurement complete but no usable return)
+  //   bit 4 = secondary return    (more than one return detected — NORMAL on a
+  //                                complex target like a cliff face; NOT a fault)
+  //   bit 5 = health (1 = good)
+  //   bit 6 = process error       ← hard fault
+  //   bit 7 = system error        ← hard fault
   const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(500);
   std::uint8_t last_status = 0xFF;
   while (std::chrono::steady_clock::now() < deadline) {
@@ -151,8 +155,15 @@ bool GarminLidarLiteV3HPSensor::WaitForReady() {
       return false;
     }
 
-    if ((status & 0x10U) != 0U) {
-      last_error_ = "lidar reports system failure (status bit 4 set)";
+    // Real errors only: system error (bit 7) or process error (bit 6). The old
+    // code latched on bit 4 (secondary return), which fires on virtually every
+    // cell of a real cliff-face scan — that was a driver bug, not a sensor
+    // fault. Secondary returns are informational; we ignore them here.
+    if ((status & 0xC0U) != 0U) {
+      char buf[64];
+      std::snprintf(buf, sizeof(buf),
+                    "lidar reports hardware error (status=0x%02X)", status);
+      last_error_ = buf;
       return false;
     }
 
