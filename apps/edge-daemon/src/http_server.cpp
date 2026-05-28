@@ -130,6 +130,12 @@ json SnapshotToJson(const Snapshot& s) {
                                       ? json(*s.last_completed_scan_at) : json(nullptr);
   root["controlLeaseExpiresAt"] = s.control_lease_expires_at.has_value()
                                       ? json(*s.control_lease_expires_at) : json(nullptr);
+  // Single-point distance result (the "Measure" button). -1 ⇒ no reading yet.
+  root["lastDistanceM"]        = s.last_distance_m;
+  root["lastDistanceAtYaw"]    = s.last_distance_at_yaw;
+  root["lastDistanceAtPitch"]  = s.last_distance_at_pitch;
+  root["lastDistanceTakenAt"]  = s.last_distance_taken_at.has_value()
+                                      ? json(*s.last_distance_taken_at) : json(nullptr);
   return root;
 }
 

@@ -312,7 +312,38 @@ select {
     flex: 1;
     height: 12px;
     border-radius: 999px;
-    background: linear-gradient(90deg, #113c36, #0f6d60, #e7a93d, #f0f4f5);
+    /* Turbo-style gradient — same stops as paletteRgb() in app.js. Reads
+       left→right as "near" (warm) to "far" (cool) to match the heatmap. */
+    background: linear-gradient(
+        90deg,
+        rgb(122, 4, 3) 0%,
+        rgb(231, 79, 43) 13%,
+        rgb(248, 137, 73) 26%,
+        rgb(253, 213, 87) 39%,
+        rgb(175, 240, 91) 52%,
+        rgb(80, 234, 134) 65%,
+        rgb(38, 197, 224) 78%,
+        rgb(70, 107, 227) 90%,
+        rgb(48, 18, 59) 100%
+    );
+}
+
+.dist-range {
+    display: flex;
+    gap: 16px;
+    align-items: center;
+    margin-bottom: 12px;
+}
+
+.dist-range .field-inline { flex: 1; }
+
+.measure-btn {
+    width: 100%;
+    margin-top: 8px;
+}
+
+.telemetry-card-wide {
+    grid-column: 1 / -1;
 }
 
 .telemetry-grid {

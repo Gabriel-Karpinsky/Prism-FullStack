@@ -9,11 +9,17 @@ const state = {
   // cells that changed, which we paint individually instead of redrawing the
   // whole canvas every 700 ms. gridGeneration tracks the server's grid identity
   // (bumps on resolution change / scan reset → triggers a full rebuild).
+  // Cell values are raw distances in metres (-1 = unfilled); the UI maps to
+  // colour via the user-settable [distMin, distMax] range below.
   grid: null,
   gridW: 0,
   gridH: 0,
   gridGeneration: 0,
   gridSince: 0,
+  // Distance range that maps onto the colour palette (metres). Closer than
+  // distMin saturates at the "near" colour; farther than distMax at "far".
+  distMin: 0.5,
+  distMax: 10.0,
 };
 
 const el = {
@@ -36,6 +42,12 @@ const el = {
   activityLog: document.getElementById("activity-log"),
   mapCanvas: document.getElementById("surface-map"),
   overlayCanvas: document.getElementById("surface-overlay"),
+  distMinInput: document.getElementById("dist-min-input"),
+  distMaxInput: document.getElementById("dist-max-input"),
+  legendMin: document.getElementById("legend-min"),
+  legendMax: document.getElementById("legend-max"),
+  lastDistanceValue: document.getElementById("last-distance-value"),
+  measureBtn: document.getElementById("measure-btn"),
   // Motion config panel
   mcYawMin:    document.getElementById("mc-yaw-min"),
   mcYawMax:    document.getElementById("mc-yaw-max"),
@@ -75,29 +87,52 @@ async function request(path, options = {}) {
   return body;
 }
 
-function colorForHeight(value) {
-  if (value < 0) return "#12343b";
-  const stops = [
-    { p: 0.0, c: [17, 60, 54] },
-    { p: 0.25, c: [18, 109, 96] },
-    { p: 0.55, c: [64, 156, 129] },
-    { p: 0.8, c: [231, 169, 61] },
-    { p: 1.0, c: [240, 244, 245] },
-  ];
+// Turbo-style perceptually-graduated palette (deep blue → cyan → green → yellow
+// → orange → deep red). High contrast, sequential, and the convention many
+// commercial LIDAR viewers use for depth — close points are warm (red/orange),
+// far points are cool (blue), matching operator intuition.
+const TURBO_STOPS = [
+  { p: 0.00, c: [48, 18, 59] },
+  { p: 0.13, c: [70, 107, 227] },
+  { p: 0.26, c: [38, 197, 224] },
+  { p: 0.39, c: [80, 234, 134] },
+  { p: 0.52, c: [175, 240, 91] },
+  { p: 0.65, c: [253, 213, 87] },
+  { p: 0.78, c: [248, 137, 73] },
+  { p: 0.90, c: [231, 79, 43] },
+  { p: 1.00, c: [122, 4, 3] },
+];
 
-  for (let i = 0; i < stops.length - 1; i += 1) {
-    const left = stops[i];
-    const right = stops[i + 1];
-    if (value >= left.p && value <= right.p) {
-      const t = (value - left.p) / (right.p - left.p);
-      const rgb = left.c.map((channel, index) =>
-        Math.round(channel + (right.c[index] - channel) * t)
-      );
-      return `rgb(${rgb[0]}, ${rgb[1]}, ${rgb[2]})`;
+function paletteRgb(t) {
+  // t in [0, 1] → "rgb(r,g,b)". Linear interpolation between TURBO_STOPS.
+  if (t <= 0) return `rgb(${TURBO_STOPS[0].c.join(",")})`;
+  if (t >= 1) return `rgb(${TURBO_STOPS[TURBO_STOPS.length - 1].c.join(",")})`;
+  for (let i = 0; i < TURBO_STOPS.length - 1; i += 1) {
+    const a = TURBO_STOPS[i];
+    const b = TURBO_STOPS[i + 1];
+    if (t >= a.p && t <= b.p) {
+      const f = (t - a.p) / (b.p - a.p);
+      const r = Math.round(a.c[0] + (b.c[0] - a.c[0]) * f);
+      const g = Math.round(a.c[1] + (b.c[1] - a.c[1]) * f);
+      const bl = Math.round(a.c[2] + (b.c[2] - a.c[2]) * f);
+      return `rgb(${r},${g},${bl})`;
     }
   }
+  return `rgb(${TURBO_STOPS[TURBO_STOPS.length - 1].c.join(",")})`;
+}
 
-  return "rgb(240, 244, 245)";
+// Map a raw distance (metres) into a colour using the user's [distMin, distMax]
+// range. Distances NEAR the scanner come out at the "near" end of the palette
+// (red); FAR distances at the "far" end (blue). Unfilled cells (-1) return the
+// background sentinel and aren't painted.
+function colorForDistance(distance_m) {
+  if (distance_m < 0) return null;
+  const lo = Math.min(state.distMin, state.distMax);
+  const hi = Math.max(state.distMin, state.distMax);
+  const span = Math.max(1e-6, hi - lo);
+  // Invert: closer ⇒ higher palette index ⇒ warm.
+  const t = 1 - (distance_m - lo) / span;
+  return paletteRgb(Math.max(0, Math.min(1, t)));
 }
 
 // The heatmap lives on #surface-map; the head marker lives on the #surface-overlay
@@ -110,9 +145,15 @@ function paintCellByIndex(i) {
   const y = Math.floor(i / state.gridW);
   const cw = el.mapCanvas.width / state.gridW;
   const ch = el.mapCanvas.height / state.gridH;
-  ctx.fillStyle = colorForHeight(state.grid[i]);
+  const colour = colorForDistance(state.grid[i]);
+  if (!colour) return;  // unfilled cell — let the background show through
+  ctx.fillStyle = colour;
+  // Flip Y so y=0 (pitchMin, lowest pitch) is at the BOTTOM of the canvas.
+  // Without this the scan looks upside-down (scanner starts at low pitch, but
+  // canvas (0,0) is top-left, so the first row painted ends up at the top).
+  const py = (state.gridH - 1 - y) * ch;
   // +1 avoids hairline seams between cells at fractional sizes.
-  ctx.fillRect(x * cw, y * ch, cw + 1, ch + 1);
+  ctx.fillRect(x * cw, py, cw + 1, ch + 1);
 }
 
 function repaintAllCells() {
@@ -136,7 +177,8 @@ function drawMarker(snapshot) {
 
   const { yawMin, yawMax, pitchMin, pitchMax } = snapshot.scanSettings;
   const markerX = ((snapshot.yaw - yawMin) / Math.max(1, yawMax - yawMin)) * w;
-  const markerY = ((snapshot.pitch - pitchMin) / Math.max(1, pitchMax - pitchMin)) * h;
+  // Y-flip: high pitch at the TOP, low pitch at the BOTTOM (matches cell paint).
+  const markerY = ((pitchMax - snapshot.pitch) / Math.max(1, pitchMax - pitchMin)) * h;
 
   octx.strokeStyle = "rgba(255,255,255,0.9)";
   octx.lineWidth = 2;
@@ -270,8 +312,29 @@ function renderState(snapshot) {
     el.faultBanner.textContent = "";
   }
 
+  renderLastDistance(snapshot);
   renderLog(snapshot.activity);
   drawMarker(snapshot);
+}
+
+// Format the single-point distance result (`Measure` button). Showns nothing
+// until a measurement has been taken.
+function renderLastDistance(snapshot) {
+  if (!el.lastDistanceValue) return;
+  if (typeof snapshot.lastDistanceM !== "number" || snapshot.lastDistanceM < 0) {
+    el.lastDistanceValue.textContent = "—";
+    return;
+  }
+  const dist = snapshot.lastDistanceM.toFixed(2);
+  const y = (snapshot.lastDistanceAtYaw || 0).toFixed(1);
+  const p = (snapshot.lastDistanceAtPitch || 0).toFixed(1);
+  el.lastDistanceValue.textContent = `${dist} m  @ yaw ${y}°, pitch ${p}°`;
+}
+
+// Keep the legend labels in sync with the user-set distance range.
+function updateLegend() {
+  if (el.legendMin) el.legendMin.textContent = `${state.distMin.toFixed(1)} m`;
+  if (el.legendMax) el.legendMax.textContent = `${state.distMax.toFixed(1)} m`;
 }
 
 async function pollState() {
@@ -459,6 +522,29 @@ el.resolutionSelect.addEventListener("change", () => {
 el.scanModeSelect.addEventListener("change", () => {
   sendCommand("set_scan_mode", { mode: el.scanModeSelect.value });
 });
+
+// Distance range → re-tint the heatmap with the new bounds. We don't refetch
+// the grid; only the colour mapping changes.
+function onDistanceRangeChange() {
+  if (!el.distMinInput || !el.distMaxInput) return;
+  const lo = parseFloat(el.distMinInput.value);
+  const hi = parseFloat(el.distMaxInput.value);
+  if (Number.isFinite(lo)) state.distMin = lo;
+  if (Number.isFinite(hi)) state.distMax = hi;
+  updateLegend();
+  repaintAllCells();
+}
+if (el.distMinInput) el.distMinInput.addEventListener("change", onDistanceRangeChange);
+if (el.distMaxInput) el.distMaxInput.addEventListener("change", onDistanceRangeChange);
+
+// Initialise the range inputs from state defaults and paint the legend once.
+if (el.distMinInput) el.distMinInput.value = state.distMin;
+if (el.distMaxInput) el.distMaxInput.value = state.distMax;
+updateLegend();
+
+if (el.measureBtn) {
+  el.measureBtn.addEventListener("click", () => sendCommand("single_distance"));
+}
 
 pollState();
 loadMotionConfig();

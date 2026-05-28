@@ -46,6 +46,11 @@ type state struct {
 	faults              []string
 	activity            []ActivityEntry
 	motionConfig        MotionConfig
+	// Single-point distance from the "Measure" button.
+	lastDistanceM       float64
+	lastDistanceAtYaw   float64
+	lastDistanceAtPitch float64
+	lastDistanceTakenAt *time.Time
 }
 
 type Service struct {
@@ -75,6 +80,7 @@ func NewService() *Service {
 				Yaw:   AxisMotion{MinDeg: -50, MaxDeg: 50, MaxSpeedDegS: 18, AccelDegS2: 60},
 				Pitch: AxisMotion{MinDeg: -30, MaxDeg: 30, MaxSpeedDegS: 12, AccelDegS2: 40},
 			},
+			lastDistanceM: -1, // no reading taken yet
 		},
 	}
 
@@ -85,12 +91,19 @@ func NewService() *Service {
 }
 
 // strideForResolution maps a preset name to a sampling stride in microsteps.
+// "half" and "quarter" are intermediate options between standard (1 full step)
+// and fine (1/8 step) — useful when standard is too sparse but fine doesn't
+// have torque to move continuously.
 func strideForResolution(preset string) int {
 	switch preset {
 	case "max":
 		return 1
 	case "fine":
 		return max(1, simMicrosteps/8)
+	case "quarter":
+		return max(1, simMicrosteps/4)
+	case "half":
+		return max(1, simMicrosteps/2)
 	case "coarse":
 		return max(1, simMicrosteps*4)
 	default: // "standard"
@@ -100,7 +113,7 @@ func strideForResolution(preset string) int {
 
 func validResolution(preset string) bool {
 	switch preset {
-	case "coarse", "standard", "fine", "max":
+	case "coarse", "standard", "half", "quarter", "fine", "max":
 		return true
 	default:
 		return false
@@ -297,6 +310,22 @@ func (s *Service) Command(user, command string, payload map[string]any) (Snapsho
 		}
 		s.state.scanSettings.ScanMode = mode
 		s.addLog("scanner", "info", "Scan mode set to "+mode+".")
+	case "single_distance":
+		// Sim only — synthesize a plausible distance so the UI button has
+		// something to display when SCANNER_BACKEND=sim.
+		if s.state.mode == "scanning" || s.state.mode == "paused" {
+			return Snapshot{}, errors.New("stop the current scan before measuring")
+		}
+		phase := float64(time.Now().UTC().UnixMilli()) / 1000.0
+		distance := round2(2.5 + math.Sin(phase*0.7)*0.6 + math.Cos(phase*1.3)*0.3)
+		now := time.Now().UTC()
+		s.state.lastDistanceM = distance
+		s.state.lastDistanceAtYaw = s.state.yaw
+		s.state.lastDistanceAtPitch = s.state.pitch
+		s.state.lastDistanceTakenAt = &now
+		s.addLog("sensor", "info",
+			"Single distance: "+strconv.FormatFloat(distance, 'f', 2, 64)+" m at yaw="+
+				formatFloat(s.state.yaw)+", pitch="+formatFloat(s.state.pitch))
 	case "start_scan":
 		if !s.state.connected {
 			return Snapshot{}, errors.New("scanner is not connected")
@@ -449,6 +478,10 @@ func (s *Service) snapshotLocked() Snapshot {
 		Metrics:               s.state.metrics,
 		Faults:                cloneStrings(s.state.faults),
 		Activity:              cloneActivity(s.state.activity),
+		LastDistanceM:         s.state.lastDistanceM,
+		LastDistanceAtYaw:     s.state.lastDistanceAtYaw,
+		LastDistanceAtPitch:   s.state.lastDistanceAtPitch,
+		LastDistanceTakenAt:   timeStringPtr(s.state.lastDistanceTakenAt),
 		// GridUpdate is attached only by SnapshotDelta (the poll path).
 	}
 }
@@ -573,16 +606,23 @@ func coordForIndex(index, w int) (int, int) {
 	return col, row
 }
 
+// sampleHeight returns a synthetic distance in metres for sim grid cells.
+// (Kept under the existing name since fillToLocked already calls it; the daemon
+// now stores raw distance in metres too, so the sim matches.) Shape is the
+// previous 0..1 "surface" function mapped to roughly [1, 5] m so the UI's
+// configurable distance-range slider has interesting values to chew on.
 func sampleHeight(x, y, w, h int) float64 {
 	xf := (float64(x) / float64(max(1, w-1))) * 4.6
 	yf := (float64(y) / float64(max(1, h-1))) * 3.2
 
-	value := 0.28 + (float64((h-1)-y)/float64(max(1, h-1)))*0.34
-	value += math.Exp(-(math.Pow(xf-2.25, 2.0) * 1.55)) * 0.52
-	value += (math.Sin(xf*2.1) * 0.11) + (math.Cos(yf*3.5) * 0.07)
-	value -= math.Exp(-((math.Pow(xf-3.3, 2.0) + math.Pow(yf-1.25, 2.0)) * 3.8)) * 0.21
+	surface := 0.28 + (float64((h-1)-y)/float64(max(1, h-1)))*0.34
+	surface += math.Exp(-(math.Pow(xf-2.25, 2.0) * 1.55)) * 0.52
+	surface += (math.Sin(xf*2.1) * 0.11) + (math.Cos(yf*3.5) * 0.07)
+	surface -= math.Exp(-((math.Pow(xf-3.3, 2.0) + math.Pow(yf-1.25, 2.0)) * 3.8)) * 0.21
+	surface = clamp(surface, 0, 1)
 
-	return round4(clamp(value, 0, 1))
+	// High "surface" ⇒ feature closer to scanner ⇒ shorter distance.
+	return round2(5.0 - 4.0*surface)
 }
 
 func timeStringPtr(t *time.Time) *string {

@@ -219,6 +219,26 @@ double MotionController::yaw_deg() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return yaw_.current_deg();
 }
+double MotionController::live_yaw_deg() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!sweep_active_) return yaw_.current_deg();
+  // Mirrors SweepMicrostepsTravelled() but converts to degrees and applies
+  // direction. yaw_.current_deg() at this point is the row start (the sweep
+  // only Commits at the end), so we offset from there.
+  const auto elapsed = std::chrono::steady_clock::now() - sweep_start_time_;
+  const auto us = std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count();
+  const auto& times = sweep_plan_.step_times_us;
+  long travelled = 0;
+  if (!times.empty() && us > 0) {
+    const std::uint32_t key = static_cast<std::uint32_t>(us);
+    auto it = std::upper_bound(times.begin(), times.end(), key);
+    travelled = static_cast<long>(std::distance(times.begin(), it));
+    travelled = std::min(travelled, static_cast<long>(sweep_plan_.steps));
+  }
+  const double mspd = yaw_.microsteps_per_deg();
+  const double delta_deg = (mspd > 0.0) ? static_cast<double>(travelled) / mspd : 0.0;
+  return yaw_.current_deg() + (sweep_plan_.forward ? delta_deg : -delta_deg);
+}
 double MotionController::pitch_deg() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return pitch_.current_deg();

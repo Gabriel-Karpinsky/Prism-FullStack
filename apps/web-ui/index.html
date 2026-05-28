@@ -66,6 +66,7 @@
                         <button data-jog-axis="pitch" data-jog-delta="-3" class="btn">Pitch -3°</button>
                         <button data-jog-axis="pitch" data-jog-delta="3" class="btn">Pitch +3°</button>
                     </div>
+                    <button id="measure-btn" class="btn btn-primary measure-btn">Measure single point</button>
                 </div>
 
                 <label class="field">
@@ -81,6 +82,8 @@
                     <select id="resolution-select">
                         <option value="coarse">Coarse — every 4 full steps</option>
                         <option value="standard" selected>Standard — 1 full step</option>
+                        <option value="half">Half — every ½ step</option>
+                        <option value="quarter">Quarter — every ¼ step</option>
                         <option value="fine">Fine — every ⅛ step</option>
                         <option value="max">Maximum — every microstep</option>
                     </select>
@@ -93,16 +96,30 @@
             <section class="panel panel-map">
                 <div class="panel-head">
                     <h2>Live surface map</h2>
-                    <p>Synthetic height data is filled in raster order to mimic a cliff-face scan.</p>
+                    <p>Cells are coloured by distance to the target. Set the range that
+                       maps onto the palette below — closer than min is saturated warm,
+                       farther than max is saturated cool.</p>
                 </div>
+
+                <div class="dist-range">
+                    <label class="field-inline">
+                        <span>Near (m)</span>
+                        <input id="dist-min-input" type="number" step="0.1" min="0" value="0.5">
+                    </label>
+                    <label class="field-inline">
+                        <span>Far (m)</span>
+                        <input id="dist-max-input" type="number" step="0.1" min="0" value="10">
+                    </label>
+                </div>
+
                 <div class="map-stack">
                     <canvas id="surface-map" width="960" height="480"></canvas>
                     <canvas id="surface-overlay" width="960" height="480"></canvas>
                 </div>
                 <div class="map-legend">
-                    <span>Low</span>
+                    <span id="legend-min">0.5 m</span>
                     <div class="legend-bar"></div>
-                    <span>High</span>
+                    <span id="legend-max">10.0 m</span>
                 </div>
             </section>
 
@@ -127,6 +144,10 @@
                     <div class="telemetry-card">
                         <span>Progress</span>
                         <strong id="progress-value">0%</strong>
+                    </div>
+                    <div class="telemetry-card telemetry-card-wide">
+                        <span>Last distance</span>
+                        <strong id="last-distance-value">—</strong>
                     </div>
                 </div>
 
